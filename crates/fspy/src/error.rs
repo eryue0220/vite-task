@@ -1,0 +1,20 @@
+use std::ffi::OsString;
+
+#[derive(thiserror::Error, Debug)]
+pub enum SpawnError {
+    #[error(
+        "could not resolve the full path of program '{program:?}' with PATH={path:?} under cwd() because: {cause}"
+    )]
+    WhichError { program: OsString, path: Option<OsString>, cause: which::Error },
+
+    #[error("failed to create IPC channel: {0}")]
+    ChannelCreationError(std::io::Error),
+
+    /// On unix systems, the injection happens before the spawn actually occurs on.
+    /// On Windows, the injection happens after the spawn but before resuming the process.
+    #[error("failed to prepare the command for injection: {0}")]
+    InjectionError(std::io::Error),
+
+    #[error("underlying os error: {0}")]
+    OsSpawnError(std::io::Error),
+}
