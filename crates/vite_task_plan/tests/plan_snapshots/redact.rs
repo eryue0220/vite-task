@@ -94,6 +94,7 @@ pub fn redact_snapshot(value: &impl Serialize, workspace_root: &str) -> serde_js
     });
 
     // Normalize Windows program names and paths by stripping common extensions for cross-platform consistency
+    // This must happen BEFORE shell redaction so that "cmd.exe" becomes "cmd" before comparison
     visit_json(&mut json_value, &mut |v| {
         let serde_json::Value::Object(map) = v else {
             return;
@@ -105,6 +106,37 @@ pub fn redact_snapshot(value: &impl Serialize, workspace_root: &str) -> serde_js
         // Normalize program_path field
         if let Some(serde_json::Value::String(program_path)) = map.get_mut("program_path") {
             strip_windows_executable_extension(program_path);
+        }
+    });
+
+    // Redact shell program and arguments for cross-platform consistency
+    // Note: os_shell_path still includes .exe because we compare against program_path before extension stripping
+    let os_shell_path = if cfg!(windows) { "C:\\Windows\\System32\\cmd" } else { "/bin/sh" };
+    let os_shell_name = if cfg!(windows) { "cmd" } else { "sh" };
+    let os_shell_args: &[&str] = if cfg!(windows) { &["/d", "/s", "/c"] } else { &["-c"] };
+    visit_json(&mut json_value, &mut |v| {
+        if let serde_json::Value::String(s) = v {
+            // Use case-insensitive comparison on Windows since path casing can vary
+            let matches_shell_path = if cfg!(windows) {
+                s.eq_ignore_ascii_case(os_shell_path)
+            } else {
+                s == os_shell_path
+            };
+            if matches_shell_path {
+                *s = "<os_shell_path>".to_string();
+            } else if s == os_shell_name {
+                *s = "<os_shell_name>".to_string();
+            }
+        } else if let serde_json::Value::Array(array) = v {
+            // Check if the beginning of the array matches the shell args
+            for (n, arg) in os_shell_args.iter().enumerate() {
+                if !matches!(array.get(n), Some(serde_json::Value::String(s)) if s == *arg) {
+                    return;
+                }
+            }
+            // Redact the shell args
+            array.drain(0..os_shell_args.len());
+            array.insert(0, serde_json::Value::String("<os_shell_args>".to_string()));
         }
     });
 
