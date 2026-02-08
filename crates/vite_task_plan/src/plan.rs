@@ -16,10 +16,7 @@ use vite_task_graph::{TaskNodeIndex, config::ResolvedTaskOptions};
 use crate::{
     ExecutionItem, ExecutionItemDisplay, ExecutionItemKind, LeafExecutionKind, PlanContext,
     SpawnCommand, SpawnExecution, TaskExecution,
-    cache_metadata::{
-        CacheMetadata, ExecutionCacheKey, ExecutionCacheKeyKind, ProgramFingerprint,
-        SpawnFingerprint,
-    },
+    cache_metadata::{CacheMetadata, ExecutionCacheKey, ProgramFingerprint, SpawnFingerprint},
     envs::EnvFingerprints,
     error::{
         CdCommandError, Error, PathFingerprintError, PathFingerprintErrorKind, PathType,
@@ -28,7 +25,7 @@ use crate::{
     execution_graph::{ExecutionGraph, ExecutionNodeIndex},
     in_process::InProcessExecution,
     path_env::get_path_env,
-    plan_request::{PlanRequest, QueryPlanRequest, SyntheticPlanRequest},
+    plan_request::{PlanRequest, QueryPlanRequest, ScriptCommand, SyntheticPlanRequest},
 };
 
 /// Locate the executable path for a given program name in the provided envs and cwd.
@@ -144,13 +141,11 @@ async fn plan_task_as_execution_node(
             }
 
             // Create execution cache key for this and_item
-            let task_execution_cache_key = ExecutionCacheKey {
-                kind: ExecutionCacheKeyKind::UserTask {
-                    task_name: task_node.task_display.task_name.clone(),
-                    and_item_index: index,
-                    extra_args: Arc::clone(&extra_args),
-                },
-                origin_path: strip_prefix_for_cache(package_path, context.workspace_path())
+            let task_execution_cache_key = ExecutionCacheKey::UserTask {
+                task_name: task_node.task_display.task_name.clone(),
+                and_item_index: index,
+                extra_args: Arc::clone(&extra_args),
+                package_path: strip_prefix_for_cache(package_path, context.workspace_path())
                     .map_err(|kind| {
                         TaskPlanErrorKind::PathFingerprintError(PathFingerprintError {
                             kind,
@@ -162,14 +157,20 @@ async fn plan_task_as_execution_node(
 
             // Try to parse the args of an and_item to a plan request like `run -r build`
             let envs: Arc<HashMap<Arc<OsStr>, Arc<OsStr>>> = context.envs().clone().into();
+            let mut script_command = ScriptCommand {
+                program: and_item.program.clone(),
+                args: args.into(),
+                envs,
+                cwd: Arc::clone(&cwd),
+            };
             let plan_request = context
                 .callbacks()
-                .get_plan_request(&and_item.program, &args, &envs, &cwd)
+                .get_plan_request(&mut script_command)
                 .await
                 .map_err(|error| TaskPlanErrorKind::ParsePlanRequestError {
-                    program: and_item.program.clone(),
-                    args: args.clone().into(),
-                    cwd: Arc::clone(&cwd),
+                    program: script_command.program.clone(),
+                    args: Arc::clone(&script_command.args),
+                    cwd: Arc::clone(&script_command.cwd),
                     error,
                 })
                 .with_plan_context(&context)?;
@@ -182,7 +183,7 @@ async fn plan_task_as_execution_node(
                     let execution_graph = plan_query_request(query_plan_request, context).await?;
                     ExecutionItemKind::Expanded(execution_graph)
                 }
-                // Synthetic task, like `vite lint`
+                // Synthetic task (from CommandHandler)
                 Some(PlanRequest::Synthetic(synthetic_plan_request)) => {
                     let spawn_execution = plan_synthetic_request(
                         context.workspace_path(),
@@ -194,20 +195,23 @@ async fn plan_task_as_execution_node(
                     .with_plan_context(&context)?;
                     ExecutionItemKind::Leaf(LeafExecutionKind::Spawn(spawn_execution))
                 }
-                // Normal 3rd party tool command (like `tsc --noEmit`)
+                // Normal 3rd party tool command (like `tsc --noEmit`), using potentially mutated script_command
                 None => {
-                    let program_path =
-                        which(&OsStr::new(&and_item.program).into(), context.envs(), &cwd)
-                            .map_err(TaskPlanErrorKind::ProgramNotFound)
-                            .with_plan_context(&context)?;
+                    let program_path = which(
+                        &OsStr::new(&script_command.program).into(),
+                        &script_command.envs,
+                        &script_command.cwd,
+                    )
+                    .map_err(TaskPlanErrorKind::ProgramNotFound)
+                    .with_plan_context(&context)?;
                     let spawn_execution = plan_spawn_execution(
                         context.workspace_path(),
-                        task_execution_cache_key,
+                        Some(task_execution_cache_key),
                         &and_item.envs,
                         &task_node.resolved_config.resolved_options,
-                        context.envs(),
+                        &script_command.envs,
                         program_path,
-                        args.into(),
+                        script_command.args,
                     )
                     .with_plan_context(&context)?;
                     ExecutionItemKind::Leaf(LeafExecutionKind::Spawn(spawn_execution))
@@ -250,13 +254,11 @@ async fn plan_task_as_execution_node(
 
         let spawn_execution = plan_spawn_execution(
             context.workspace_path(),
-            ExecutionCacheKey {
-                kind: ExecutionCacheKeyKind::UserTask {
-                    task_name: task_node.task_display.task_name.clone(),
-                    and_item_index: 0,
-                    extra_args: Arc::clone(context.extra_args()),
-                },
-                origin_path: strip_prefix_for_cache(package_path, context.workspace_path())
+            Some(ExecutionCacheKey::UserTask {
+                task_name: task_node.task_display.task_name.clone(),
+                and_item_index: 0,
+                extra_args: Arc::clone(context.extra_args()),
+                package_path: strip_prefix_for_cache(package_path, context.workspace_path())
                     .map_err(|kind| {
                         TaskPlanErrorKind::PathFingerprintError(PathFingerprintError {
                             kind,
@@ -264,7 +266,7 @@ async fn plan_task_as_execution_node(
                         })
                     })
                     .with_plan_context(&context)?,
-            },
+            }),
             &BTreeMap::new(),
             &task_node.resolved_config.resolved_options,
             context.envs(),
@@ -285,27 +287,13 @@ pub fn plan_synthetic_request(
     workspace_path: &Arc<AbsolutePath>,
     prefix_envs: &BTreeMap<Str, Str>,
     synthetic_plan_request: SyntheticPlanRequest,
-    // generated from the task, overrides `synthetic_plan_request.direct_execution_cache_key`
-    task_execution_cache_key: Option<ExecutionCacheKey>,
+    execution_cache_key: Option<ExecutionCacheKey>,
     cwd: &Arc<AbsolutePath>,
 ) -> Result<SpawnExecution, TaskPlanErrorKind> {
-    let SyntheticPlanRequest { program, args, task_options, direct_execution_cache_key, envs } =
-        synthetic_plan_request;
+    let SyntheticPlanRequest { program, args, task_options, envs } = synthetic_plan_request;
 
     let program_path = which(&program, &envs, cwd).map_err(TaskPlanErrorKind::ProgramNotFound)?;
     let resolved_options = ResolvedTaskOptions::resolve(task_options, &cwd);
-
-    let execution_cache_key = if let Some(task_execution_cache_key) = task_execution_cache_key {
-        // Use task generated cache key if any
-        task_execution_cache_key
-    } else {
-        // Otherwise, use direct execution cache key
-        ExecutionCacheKey {
-            kind: ExecutionCacheKeyKind::DirectSyntactic { direct_execution_cache_key },
-            origin_path: strip_prefix_for_cache(cwd, workspace_path)
-                .map_err(|kind| PathFingerprintError { kind, path_type: PathType::Cwd })?,
-        }
-    };
 
     plan_spawn_execution(
         workspace_path,
@@ -337,7 +325,7 @@ fn strip_prefix_for_cache(
 
 fn plan_spawn_execution(
     workspace_path: &Arc<AbsolutePath>,
-    execution_cache_key: ExecutionCacheKey,
+    execution_cache_key: Option<ExecutionCacheKey>,
     prefix_envs: &BTreeMap<Str, Str>,
     resolved_task_options: &ResolvedTaskOptions,
     envs: &HashMap<Arc<OsStr>, Arc<OsStr>>,
@@ -391,7 +379,10 @@ fn plan_spawn_execution(
             env_fingerprints,
             fingerprint_ignores: None,
         };
-        resolved_cache_metadata = Some(CacheMetadata { execution_cache_key, spawn_fingerprint });
+        if let Some(execution_cache_key) = execution_cache_key {
+            resolved_cache_metadata =
+                Some(CacheMetadata { execution_cache_key, spawn_fingerprint });
+        }
     }
 
     // Add prefix envs to all envs

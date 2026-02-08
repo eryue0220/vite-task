@@ -1,11 +1,12 @@
-use std::{env, process::ExitCode, sync::Arc};
+use std::{process::ExitCode, sync::Arc};
 
-use vite_path::{AbsolutePath, current_dir};
+use clap::Parser;
+use vite_str::Str;
 use vite_task::{
-    CLIArgs, Session,
-    session::reporter::{ExitStatus, LabeledReporter},
+    EnabledCacheConfig, ExitStatus, Session, UserCacheConfig, UserTaskOptions, get_path_env,
+    plan_request::SyntheticPlanRequest,
 };
-use vite_task_bin::{CustomTaskSubcommand, NonTaskSubcommand, OwnedSessionCallbacks};
+use vite_task_bin::{Args, OwnedSessionCallbacks, find_executable};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
@@ -14,29 +15,40 @@ async fn main() -> anyhow::Result<ExitCode> {
 }
 
 async fn run() -> anyhow::Result<ExitStatus> {
-    let cwd: Arc<AbsolutePath> = current_dir()?.into();
-    // Parse the CLI arguments and see if they are for vite-task or not
-    let args = match CLIArgs::<CustomTaskSubcommand, NonTaskSubcommand>::try_parse_from(env::args())
-    {
-        Ok(ok) => ok,
-        Err(err) => {
-            err.exit();
-        }
-    };
-    let task_cli_args = match args {
-        CLIArgs::Task(task_cli_args) => task_cli_args,
-        CLIArgs::NonTask(NonTaskSubcommand::Version) => {
-            // Non-task subcommands are not handled by vite-task's session.
-            println!("{}", env!("CARGO_PKG_VERSION"));
-            return Ok(ExitStatus::SUCCESS);
-        }
-    };
-
+    let args = Args::parse();
     let mut owned_callbacks = OwnedSessionCallbacks::default();
-    let mut session = Session::init(owned_callbacks.as_callbacks())?;
-    let plan = session.plan_from_cli(cwd, task_cli_args).await?;
-
-    // Create reporter and execute
-    let reporter = LabeledReporter::new(std::io::stdout(), session.workspace_path());
-    Ok(session.execute(plan, Box::new(reporter)).await.err().unwrap_or(ExitStatus::SUCCESS))
+    let session = Session::init(owned_callbacks.as_callbacks())?;
+    match args {
+        Args::Task(command) => session.main(command).await,
+        args => {
+            // If env FOO is set, run `print-env FOO` via Session::exec before proceeding.
+            // In vite-plus, Session::exec is used for auto-install.
+            let envs = session.envs();
+            if envs.contains_key(std::ffi::OsStr::new("FOO")) {
+                let program = find_executable(get_path_env(envs), session.cwd(), "print-env")?;
+                let request = SyntheticPlanRequest {
+                    program,
+                    args: [Str::from("FOO")].into(),
+                    task_options: UserTaskOptions {
+                        cache_config: UserCacheConfig::Enabled {
+                            cache: None,
+                            enabled_cache_config: EnabledCacheConfig {
+                                envs: Some(Box::from([Str::from("FOO")])),
+                                pass_through_envs: None,
+                            },
+                        },
+                        ..Default::default()
+                    },
+                    envs: Arc::clone(envs),
+                };
+                let cache_key: Arc<[Str]> = Arc::from([Str::from("print-env-foo")]);
+                let status = session.execute_synthetic(request, cache_key, true).await?;
+                if status != ExitStatus::SUCCESS {
+                    return Ok(status);
+                }
+            }
+            println!("{:?}", args);
+            Ok(ExitStatus::SUCCESS)
+        }
+    }
 }

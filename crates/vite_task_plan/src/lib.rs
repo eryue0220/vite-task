@@ -22,7 +22,7 @@ use execution_graph::ExecutionGraph;
 use in_process::InProcessExecution;
 pub use path_env::{get_path_env, prepend_path_env};
 use plan::{plan_query_request, plan_synthetic_request};
-use plan_request::PlanRequest;
+use plan_request::{PlanRequest, SyntheticPlanRequest};
 use serde::{Serialize, ser::SerializeMap as _};
 use vite_graph_ser::serialize_by_key;
 use vite_path::AbsolutePath;
@@ -141,13 +141,13 @@ pub enum LeafExecutionKind {
 /// An execution item, from a split subcommand in a task's command (`item1 && item2 && ...`).
 #[derive(Debug, Serialize)]
 pub enum ExecutionItemKind {
-    /// Expanded from a known vite subcommand, like `vite run ...` or `vite lint`.
+    /// Expanded from a known vite subcommand, like `vite run ...` or a synthesized task.
     Expanded(#[serde(serialize_with = "serialize_by_key")] ExecutionGraph),
     /// A normal execution that spawns a child process, like `tsc --noEmit`.
     Leaf(LeafExecutionKind),
 }
 
-/// The callback trait for parsing plan requests from cli args.
+/// The callback trait for parsing plan requests from script commands.
 /// See the method for details.
 #[async_trait::async_trait(?Send)]
 pub trait PlanRequestParser: Debug {
@@ -155,16 +155,16 @@ pub trait PlanRequestParser: Debug {
     ///
     /// `vite_task_plan` doesn't have the knowledge of how cli args should be parsed. It relies on this callback.
     ///
+    /// The implementation can either mutate `command` or return a `PlanRequest`:
     /// - If it returns `Err`, the planning will abort with the returned error.
-    /// - If it returns `Ok(None)`, the command will be spawned as a normal process.
-    /// - If it returns `Ok(Some(PlanRequest::Query)`, the command will be expanded as a `ExpandedExecution` with a task graph queried from the returned `TaskQuery`.
-    /// - If it returns `Ok(Some(PlanRequest::Synthetic)`, the command will become a `SpawnExecution` with the synthetic task.
+    /// - If it returns `Ok(None)`, the (potentially mutated) `command` will be spawned as a normal process.
+    /// - If it returns `Ok(Some(PlanRequest::Query))`, the command will be expanded as a `ExpandedExecution` with a task graph queried from the returned `TaskQuery`.
+    /// - If it returns `Ok(Some(PlanRequest::Synthetic))`, the command will become a `SpawnExecution` with the synthetic task.
+    ///
+    /// When a `PlanRequest` is returned, any mutations to `command` are discarded.
     async fn get_plan_request(
         &mut self,
-        program: &str,
-        args: &[Str],
-        envs: &Arc<HashMap<Arc<OsStr>, Arc<OsStr>>>,
-        cwd: &Arc<AbsolutePath>,
+        command: &mut plan_request::ScriptCommand,
     ) -> anyhow::Result<Option<PlanRequest>>;
 }
 
@@ -224,5 +224,23 @@ impl ExecutionPlan {
             }
         };
         Ok(Self { root_node })
+    }
+
+    pub fn plan_synthetic(
+        workspace_path: &Arc<AbsolutePath>,
+        cwd: &Arc<AbsolutePath>,
+        synthetic_plan_request: SyntheticPlanRequest,
+        cache_key: Arc<[Str]>,
+    ) -> Result<Self, Error> {
+        let execution_cache_key = cache_metadata::ExecutionCacheKey::ExecAPI(cache_key);
+        let execution = plan_synthetic_request(
+            workspace_path,
+            &Default::default(),
+            synthetic_plan_request,
+            Some(execution_cache_key),
+            cwd,
+        )
+        .with_empty_call_stack()?;
+        Ok(Self { root_node: ExecutionItemKind::Leaf(LeafExecutionKind::Spawn(execution)) })
     }
 }

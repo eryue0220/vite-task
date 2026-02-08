@@ -7,17 +7,9 @@ use vite_str::Str;
 
 use crate::envs::EnvFingerprints;
 
-/// The kind of a key to identify an execution.
-#[derive(Debug, Encode, bincode::Decode, Serialize)]
-pub(crate) enum ExecutionCacheKeyKind {
-    /// This execution is directly from a custom syntactic vite-task subcommand (like `vite lint`).
-    ///
-    /// Note that this is only for the case where the subcommand is directly typed in the cli,
-    /// not from a task script (like `"lint-task": "vite lint"`), which is covered by the `UserTask` variant.
-    DirectSyntactic {
-        /// Provided in `SyntheticPlanRequest.direct_execution_cache_key` by task synthezier
-        direct_execution_cache_key: Arc<[Str]>,
-    },
+/// Key to identify an execution across sessions.
+#[derive(Debug, Encode, Decode, Serialize)]
+pub enum ExecutionCacheKey {
     /// This execution is from a script of a user-defined task.
     UserTask {
         /// The name of the user-defined task.
@@ -28,21 +20,13 @@ pub(crate) enum ExecutionCacheKeyKind {
         /// Extra args provided when invoking the user-defined task (`vite [task_name] [extra_args...]`).
         /// These args are appended to the last and_item. Non-last and_items don't get extra args.
         extra_args: Arc<[Str]>,
+        /// The package path where the user-defined task is defined, relative to the workspace root.
+        package_path: RelativePathBuf,
     },
-}
-
-/// Key to identify an execution
-#[derive(Debug, Encode, Decode, Serialize)]
-pub struct ExecutionCacheKey {
-    /// The kind of the execution cache key (DirectSyntactic or UserTask)
-    pub(crate) kind: ExecutionCacheKeyKind,
-    /// The origin path where this execution is planned from.
-    /// It's relative to the workspace root.
+    /// This execution is from a synthetic task directly invoked from `Session::plan_exec` API.
     ///
-    /// - For DirectSyntactic, it's the cwd where the command `vite [custom subcommand] ...` is run.
-    ///   It's not necessarily the actual cwd that the synthesized task runs in.
-    /// - For UserTask, it's the package path where the user-defined task is defined.
-    pub(crate) origin_path: RelativePathBuf,
+    /// The cache key is an opaque value provided by the caller.
+    ExecAPI(Arc<[Str]>),
 }
 
 /// Cache information for a spawn execution.

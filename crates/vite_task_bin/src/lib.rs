@@ -7,48 +7,18 @@ use std::{
     sync::Arc,
 };
 
-use clap::Subcommand;
+use clap::Parser;
 use vite_path::AbsolutePath;
 use vite_str::Str;
 use vite_task::{
-    EnabledCacheConfig, SessionCallbacks, UserCacheConfig, UserTaskOptions, get_path_env,
-    plan_request::SyntheticPlanRequest,
+    Command, EnabledCacheConfig, HandledCommand, ScriptCommand, SessionCallbacks, UserCacheConfig,
+    UserTaskOptions, get_path_env, plan_request::SyntheticPlanRequest,
 };
 
-/// Theses are the custom subcommands that synthesize tasks for vite-task
-#[derive(Debug, Subcommand)]
-pub enum CustomTaskSubcommand {
-    /// oxlint
-    #[clap(disable_help_flag = true)]
-    Lint {
-        #[clap(allow_hyphen_values = true, trailing_var_arg = true)]
-        args: Vec<Str>,
-    },
-    /// vitest
-    #[clap(disable_help_flag = true)]
-    Test {
-        #[clap(allow_hyphen_values = true, trailing_var_arg = true)]
-        args: Vec<Str>,
-    },
-    /// Test command for testing additional_envs feature
-    EnvTest {
-        /// Environment variable name
-        name: Str,
-        /// Environment variable value
-        value: Str,
-    },
-}
-
-// These are the subcommands that is not handled by vite-task
-#[derive(Debug, Subcommand)]
-pub enum NonTaskSubcommand {
-    Version,
-}
-
 #[derive(Debug, Default)]
-pub struct TaskSynthesizer(());
+pub struct CommandHandler(());
 
-fn find_executable(
+pub fn find_executable(
     path_env: Option<&Arc<OsStr>>,
     cwd: &AbsolutePath,
     executable: &str,
@@ -69,53 +39,74 @@ fn find_executable(
     Ok(executable_path.into_os_string().into())
 }
 
+fn synthesize_node_modules_bin_task(
+    executable_name: &str,
+    args: &[Str],
+    envs: &Arc<HashMap<Arc<OsStr>, Arc<OsStr>>>,
+    cwd: &Arc<AbsolutePath>,
+) -> anyhow::Result<SyntheticPlanRequest> {
+    Ok(SyntheticPlanRequest {
+        program: find_executable(get_path_env(envs), &*cwd, executable_name)?,
+        args: args.into(),
+        task_options: Default::default(),
+        envs: Arc::clone(envs),
+    })
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "vite", version)]
+pub enum Args {
+    Lint {
+        #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<Str>,
+    },
+    Test {
+        #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<Str>,
+    },
+    EnvTest {
+        name: Str,
+        value: Str,
+    },
+    #[command(flatten)]
+    Task(Command),
+}
+
 #[async_trait::async_trait(?Send)]
-impl vite_task::TaskSynthesizer<CustomTaskSubcommand> for TaskSynthesizer {
-    fn should_synthesize_for_program(&self, program: &str) -> bool {
-        program == "vite"
-    }
-
-    async fn synthesize_task(
+impl vite_task::CommandHandler for CommandHandler {
+    async fn handle_command(
         &mut self,
-        subcommand: CustomTaskSubcommand,
-        envs: &Arc<HashMap<Arc<OsStr>, Arc<OsStr>>>,
-        cwd: &Arc<AbsolutePath>,
-    ) -> anyhow::Result<SyntheticPlanRequest> {
-        let synthesize_node_modules_bin_task = |subcommand_name: &str,
-                                                executable_name: &str,
-                                                args: Vec<Str>|
-         -> anyhow::Result<SyntheticPlanRequest> {
-            let direct_execution_cache_key: Arc<[Str]> =
-                iter::once(Str::from(subcommand_name)).chain(args.iter().cloned()).collect();
-            Ok(SyntheticPlanRequest {
-                program: find_executable(get_path_env(envs), &*cwd, executable_name)?,
-                args: args.into(),
-                task_options: Default::default(),
-                direct_execution_cache_key,
-                envs: Arc::clone(envs),
-            })
-        };
-
-        match subcommand {
-            CustomTaskSubcommand::Lint { args } => {
-                synthesize_node_modules_bin_task("lint", "oxlint", args)
+        command: &mut ScriptCommand,
+    ) -> anyhow::Result<HandledCommand> {
+        match command.program.as_str() {
+            "vite" => {}
+            // `vpr <args>` is shorthand for `vite run <args>`
+            "vpr" => {
+                command.program = Str::from("vite");
+                command.args =
+                    iter::once(Str::from("run")).chain(command.args.iter().cloned()).collect();
             }
-            CustomTaskSubcommand::Test { args } => {
-                synthesize_node_modules_bin_task("test", "vitest", args)
-            }
-            CustomTaskSubcommand::EnvTest { name, value } => {
-                let direct_execution_cache_key: Arc<[Str]> =
-                    [Str::from("env-test"), name.clone(), value.clone()].into();
-
-                let mut envs = HashMap::clone(&envs);
-                // Update the env var for testing
+            _ => return Ok(HandledCommand::Verbatim),
+        }
+        let args = Args::try_parse_from(
+            std::iter::once(command.program.as_str()).chain(command.args.iter().map(Str::as_str)),
+        )?;
+        match args {
+            Args::Lint { args } => Ok(HandledCommand::Synthesized(
+                synthesize_node_modules_bin_task("oxlint", &args, &command.envs, &command.cwd)?,
+            )),
+            Args::Test { args } => Ok(HandledCommand::Synthesized(
+                synthesize_node_modules_bin_task("vitest", &args, &command.envs, &command.cwd)?,
+            )),
+            Args::EnvTest { name, value } => {
+                let mut envs = HashMap::clone(&command.envs);
                 envs.insert(
                     Arc::from(OsStr::new(name.as_str())),
                     Arc::from(OsStr::new(value.as_str())),
                 );
 
-                Ok(SyntheticPlanRequest {
-                    program: find_executable(get_path_env(&envs), &*cwd, "print-env")?,
+                Ok(HandledCommand::Synthesized(SyntheticPlanRequest {
+                    program: find_executable(get_path_env(&envs), &*command.cwd, "print-env")?,
                     args: [name.clone()].into(),
                     task_options: UserTaskOptions {
                         cache_config: UserCacheConfig::Enabled {
@@ -127,10 +118,10 @@ impl vite_task::TaskSynthesizer<CustomTaskSubcommand> for TaskSynthesizer {
                         },
                         ..Default::default()
                     },
-                    direct_execution_cache_key,
                     envs: Arc::new(envs),
-                })
+                }))
             }
+            Args::Task(cli_command) => Ok(HandledCommand::ViteTaskCommand(cli_command)),
         }
     }
 }
@@ -164,14 +155,14 @@ impl vite_task::loader::UserConfigLoader for JsonUserConfigLoader {
 
 #[derive(Default)]
 pub struct OwnedSessionCallbacks {
-    task_synthesizer: TaskSynthesizer,
+    command_handler: CommandHandler,
     user_config_loader: JsonUserConfigLoader,
 }
 
 impl OwnedSessionCallbacks {
-    pub fn as_callbacks(&mut self) -> SessionCallbacks<'_, CustomTaskSubcommand> {
+    pub fn as_callbacks(&mut self) -> SessionCallbacks<'_> {
         SessionCallbacks {
-            task_synthesizer: &mut self.task_synthesizer,
+            command_handler: &mut self.command_handler,
             user_config_loader: &mut self.user_config_loader,
         }
     }

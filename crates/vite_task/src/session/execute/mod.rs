@@ -348,14 +348,14 @@ impl ExecutionContext<'_> {
     }
 }
 
-impl<'a, CustomSubcommand> Session<'a, CustomSubcommand> {
+impl<'a> Session<'a> {
     /// Execute an execution plan, reporting events to the provided reporter.
     ///
     /// Returns Err(ExitStatus) to suggest the caller to abort and exit the process with the given exit status.
     ///
     /// The return type isn't just ExitStatus because we want to distinguish between normal successful execution,
     /// and execution that failed and needs to exit with a specific code which can be zero.
-    pub async fn execute(
+    pub(crate) async fn execute(
         &self,
         plan: ExecutionPlan,
         mut reporter: Box<dyn Reporter>,
