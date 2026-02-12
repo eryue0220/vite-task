@@ -1,3 +1,12 @@
+# Clippy configuration for non-vite crates (fspy_*, subprocess_test, pty_terminal, etc.)
+# that don't depend on vite_str/vite_path.
+#
+# This is a subset of the root .clippy.toml, with rules recommending vite_str/vite_path
+# alternatives removed. Generic rules (cow_utils, rustc-hash) still apply.
+#
+# To use: symlink as `.clippy.toml` in the crate's directory:
+#   ln -s ../../.non-vite.clippy.toml .clippy.toml
+
 avoid-breaking-exported-api = false
 
 disallowed-methods = [
@@ -7,7 +16,6 @@ disallowed-methods = [
   { path = "str::to_uppercase", reason = "To avoid memory allocation, use `cow_utils::CowUtils::cow_to_uppercase` instead." },
   { path = "str::replace", reason = "To avoid memory allocation, use `cow_utils::CowUtils::cow_replace` instead." },
   { path = "str::replacen", reason = "To avoid memory allocation, use `cow_utils::CowUtils::cow_replacen` instead." },
-  { path = "std::env::current_dir", reason = "To get an `AbsolutePathBuf`, Use `vite_path::current_dir` instead." },
   { path = "std::thread::sleep", reason = "Use proper synchronization (channels, condvars, etc.) instead of sleeping. Sleep is only acceptable for intentional user-facing delays (e.g. animations, debouncing)." },
   { path = "tokio::time::sleep", reason = "Use proper synchronization (channels, signals, etc.) instead of sleeping. Sleep is only acceptable for intentional user-facing delays (e.g. animations, debouncing)." },
 ]
@@ -15,11 +23,4 @@ disallowed-methods = [
 disallowed-types = [
   { path = "std::collections::HashMap", reason = "Use `rustc_hash::FxHashMap` instead, which is typically faster." },
   { path = "std::collections::HashSet", reason = "Use `rustc_hash::FxHashSet` instead, which is typically faster." },
-  { path = "std::path::Path", reason = "Use `vite_path::RelativePath` or `vite_path::AbsolutePath` instead" },
-  { path = "std::path::PathBuf", reason = "Use `vite_path::RelativePathBuf` or `vite_path::AbsolutePathBuf` instead" },
-  { path = "std::string::String", reason = "Use `vite_str::Str` for small strings. For large strings, prefer `Box/Rc/Arc<str>` if mutation is not needed." },
-]
-
-disallowed-macros = [
-  { path = "std::format", reason = "Use `vite_str::format` for small strings." },
 ]

@@ -62,6 +62,7 @@ cow-utils = "0.1.3"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 csv-async = { version = "1.3.1", features = ["tokio"] }
 ctor = "0.6"
+ctrlc = "3.5.2"
 derive_more = "2.0.1"
 diff-struct = "0.5.3"
 directories = "6.0.0"
@@ -92,6 +93,7 @@ petgraph = "0.8.2"
 phf = { version = "0.11.3", features = ["macros"] }
 portable-pty = "0.9.0"
 pretty_assertions = "1.4.1"
+pty_terminal = { path = "crates/pty_terminal" }
 rand = "0.9.1"
 ratatui = "0.30.0"
 rayon = "1.10.0"
@@ -129,7 +131,6 @@ vec1 = "1.12.1"
 vite_glob = { path = "crates/vite_glob" }
 vite_graph_ser = { path = "crates/vite_graph_ser" }
 vite_path = { path = "crates/vite_path" }
-vite_pty = { path = "crates/vite_pty" }
 vite_shell = { path = "crates/vite_shell" }
 vite_str = { path = "crates/vite_str" }
 vite_task = { path = "crates/vite_task" }

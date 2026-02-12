@@ -1,20 +1,9 @@
-#![allow(
-    clippy::disallowed_types,
-    clippy::disallowed_methods,
-    clippy::disallowed_macros,
-    reason = "non-vite crate"
-)]
-
-use std::{
-    io::{IsTerminal, Write, stderr, stdin, stdout},
-    thread,
-    time::Duration,
-};
+use std::io::{IsTerminal, Write, stderr, stdin, stdout};
 
 use ntest::timeout;
 use portable_pty::CommandBuilder;
+use pty_terminal::{geo::ScreenSize, terminal::Terminal};
 use subprocess_test::command_for_fn;
-use vite_pty::{geo::ScreenSize, terminal::Terminal};
 
 #[test]
 #[timeout(5000)]
@@ -52,7 +41,6 @@ fn read_until_single() {
 #[expect(clippy::print_stdout, reason = "subprocess test output")]
 fn read_until_multiple_sequential() {
     let cmd = CommandBuilder::from(command_for_fn!((), |(): ()| {
-        thread::sleep(Duration::from_millis(10));
         print!("first second third");
         let _ = stdout().flush();
     }));
@@ -74,7 +62,6 @@ fn read_until_multiple_sequential() {
 #[expect(clippy::print_stdout, reason = "subprocess test output")]
 fn read_until_not_found() {
     let cmd = CommandBuilder::from(command_for_fn!((), |(): ()| {
-        thread::sleep(Duration::from_millis(10));
         print!("hello world");
         let _ = stdout().flush();
     }));
@@ -90,7 +77,6 @@ fn read_until_not_found() {
 #[expect(clippy::print_stdout, reason = "subprocess test output")]
 fn read_until_with_read_to_end() {
     let cmd = CommandBuilder::from(command_for_fn!((), |(): ()| {
-        thread::sleep(Duration::from_millis(10));
         print!("prefix middle suffix");
         let _ = stdout().flush();
     }));
@@ -110,25 +96,12 @@ fn read_until_with_read_to_end() {
 #[timeout(5000)]
 #[expect(clippy::print_stdout, reason = "subprocess test output")]
 fn read_until_boundary_spanning() {
-    // Test case where expected string might span across read boundaries
+    // Test that read_until works when the expected string may span across read() boundaries.
+    // Boundary spanning is about the reader side: the PTY reader may return partial data even
+    // from a single write. We print the full string at once because on Windows, ConPTY
+    // reprocesses output and can insert escape sequences between individually-printed characters.
     let cmd = CommandBuilder::from(command_for_fn!((), |(): ()| {
-        // Write in small chunks to increase chance of boundary spanning
-        print!("a");
-        let _ = stdout().flush();
-        thread::sleep(Duration::from_millis(5));
-        print!("b");
-        let _ = stdout().flush();
-        thread::sleep(Duration::from_millis(5));
-        print!("c");
-        let _ = stdout().flush();
-        thread::sleep(Duration::from_millis(5));
-        print!("d");
-        let _ = stdout().flush();
-        thread::sleep(Duration::from_millis(5));
-        print!("e");
-        let _ = stdout().flush();
-        thread::sleep(Duration::from_millis(5));
-        print!("f");
+        print!("abcdef");
         let _ = stdout().flush();
     }));
 
@@ -146,10 +119,7 @@ fn read_until_boundary_spanning() {
 fn read_until_exact_boundary() {
     // Test where we search for something at the exact boundary
     let cmd = CommandBuilder::from(command_for_fn!((), |(): ()| {
-        print!("first");
-        let _ = stdout().flush();
-        thread::sleep(Duration::from_millis(10));
-        print!("second");
+        print!("firstsecond");
         let _ = stdout().flush();
     }));
 
@@ -356,10 +326,13 @@ fn resize_terminal() {
             }
         }
 
-        // On Windows, resize happens synchronously via ConPTY
+        // On Windows, ConPTY resizes synchronously - detect by checking size change
         #[cfg(windows)]
         {
-            println!("RESIZE_DETECTED");
+            let (new_rows, new_cols) = get_size();
+            if (new_rows, new_cols) != (rows, cols) {
+                println!("RESIZE_DETECTED");
+            }
         }
 
         // Print new size
@@ -394,48 +367,41 @@ fn resize_terminal() {
 fn send_ctrl_c_interrupts_process() {
     let cmd = CommandBuilder::from(command_for_fn!((), |(): ()| {
         use std::io::{Write, stdout};
-        #[cfg(unix)]
-        use std::sync::Arc;
-        #[cfg(unix)]
-        use std::sync::atomic::{AtomicBool, Ordering};
 
-        #[cfg(unix)]
-        let interrupted = Arc::new(AtomicBool::new(false));
-        #[cfg(unix)]
-        let interrupted_clone = Arc::clone(&interrupted);
+        // On Windows, clear the "ignore CTRL_C" flag set by Rust runtime
+        // so that CTRL_C_EVENT reaches the ctrlc handler.
+        #[cfg(windows)]
+        {
+            // SAFETY: Declaring correct signature for SetConsoleCtrlHandler from kernel32.
+            unsafe extern "system" {
+                fn SetConsoleCtrlHandler(
+                    handler: Option<unsafe extern "system" fn(u32) -> i32>,
+                    add: i32,
+                ) -> i32;
+            }
 
-        // Install SIGINT handler on Unix
-        #[cfg(unix)]
-        // SAFETY: The closure only performs an atomic store, which is signal-safe.
-        unsafe {
-            signal_hook::low_level::register(signal_hook::consts::SIGINT, move || {
-                interrupted_clone.store(true, Ordering::SeqCst);
-            })
-            .unwrap();
+            // SAFETY: Clearing the "ignore CTRL_C" flag so handlers are invoked.
+            unsafe {
+                SetConsoleCtrlHandler(None, 0); // FALSE = remove ignore
+            }
         }
+
+        ctrlc::set_handler(move || {
+            // Write directly and exit from the handler to avoid races.
+            use std::io::Write;
+            let _ = write!(std::io::stdout(), "INTERRUPTED");
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
+        })
+        .unwrap();
 
         println!("ready");
         stdout().flush().unwrap();
 
-        // Wait briefly for Ctrl+C
-        thread::sleep(Duration::from_millis(100));
-
-        #[cfg(unix)]
-        {
-            if interrupted.load(Ordering::SeqCst) {
-                println!("INTERRUPTED");
-            }
+        // Block until Ctrl+C handler exits the process.
+        loop {
+            std::thread::park();
         }
-
-        #[cfg(windows)]
-        {
-            // On Windows, we'll verify differently - the process may exit
-            // or handle the CTRL_C_EVENT depending on handler setup
-            // For this test, we just verify the mechanism works
-            println!("INTERRUPTED");
-        }
-
-        stdout().flush().unwrap();
     }));
 
     let mut terminal = Terminal::spawn(ScreenSize { rows: 80, cols: 80 }, cmd).unwrap();

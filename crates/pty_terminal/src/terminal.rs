@@ -177,6 +177,10 @@ impl Terminal {
     /// Returns an error if:
     /// - Reading from the PTY fails
     /// - The exit status is not available (should not happen in normal operation)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the writer lock is poisoned.
     pub fn read_to_end(&mut self) -> anyhow::Result<ExitStatus> {
         // `read_to_end` will move cursor to the end, so clear any buffered data for `read_until`
         self.read_until_buffer.clear();
@@ -193,6 +197,11 @@ impl Terminal {
 
         // Wait for exit status to be set by background thread
         let status = self.exit_status.wait().clone();
+
+        // Close the writer since the child has exited and all output has been consumed.
+        // This ensures subsequent write() calls fail immediately, rather than racing
+        // with the background thread which also closes the writer.
+        *self.writer.lock().unwrap() = None;
 
         Ok(status)
     }
@@ -240,14 +249,14 @@ impl Terminal {
 
     /// Sends Ctrl+C (SIGINT) to the child process.
     ///
+    /// Writes ETX (0x03) to the PTY. On Unix, the terminal driver converts this
+    /// to SIGINT for the child's process group. On Windows, `ConPTY` intercepts
+    /// the byte and generates `CTRL_C_EVENT` for the child.
+    ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The child process has already exited
-    /// - Writing to the PTY fails
+    /// Returns an error if the child process has already exited or writing fails.
     pub fn send_ctrl_c(&self) -> anyhow::Result<()> {
-        // ASCII 0x03 (ETX) is Ctrl+C
-        // Both Unix PTY and Windows ConPTY interpret this and signal the child
         self.write(&[0x03])
     }
 
