@@ -4,7 +4,7 @@ mod execute;
 pub(crate) mod reporter;
 
 // Re-export types that are part of the public API
-use std::{ffi::OsStr, fmt::Debug, sync::Arc};
+use std::{ffi::OsStr, fmt::Debug, io::IsTerminal, sync::Arc};
 
 use cache::ExecutionCache;
 pub use cache::{CacheMiss, FingerprintMismatch};
@@ -14,9 +14,10 @@ pub use reporter::ExitStatus;
 use reporter::LabeledReporter;
 use rustc_hash::FxHashMap;
 use vite_path::{AbsolutePath, AbsolutePathBuf};
+use vite_select::SelectItem;
 use vite_str::Str;
 use vite_task_graph::{
-    IndexedTaskGraph, TaskGraph, TaskGraphLoadError, config::user::UserCacheConfig,
+    IndexedTaskGraph, TaskGraph, TaskGraphLoadError, TaskSpecifier, config::user::UserCacheConfig,
     loader::UserConfigLoader,
 };
 use vite_task_plan::{
@@ -26,7 +27,7 @@ use vite_task_plan::{
 };
 use vite_workspace::{WorkspaceRoot, find_workspace_root};
 
-use crate::cli::{CacheSubcommand, Command, RunCommand};
+use crate::cli::{CacheSubcommand, Command, RunCommand, RunFlags};
 
 #[derive(Debug)]
 enum LazyTaskGraph<'a> {
@@ -98,13 +99,18 @@ impl vite_task_plan::PlanRequestParser for PlanRequestParser<'_> {
         match self.command_handler.handle_command(command).await? {
             HandledCommand::Synthesized(synthetic) => Ok(Some(PlanRequest::Synthetic(synthetic))),
             HandledCommand::ViteTaskCommand(cli_command) => match cli_command {
-                Command::Cache { .. } => Ok(Some(PlanRequest::Synthetic(SyntheticPlanRequest {
-                    program: Arc::from(OsStr::new(command.program.as_str())),
-                    args: Arc::clone(&command.args),
-                    cache_config: UserCacheConfig::disabled(),
-                    envs: Arc::clone(&command.envs),
-                }))),
-                Command::Run(run_command) => Ok(Some(run_command.into_plan_request(&command.cwd)?)),
+                Command::Cache { .. } => Ok(Some(PlanRequest::Synthetic(
+                    command.to_synthetic_plan_request(UserCacheConfig::disabled()),
+                ))),
+                Command::Run(run_command) => match run_command.into_plan_request(&command.cwd) {
+                    Ok(plan_request) => Ok(Some(plan_request)),
+                    Err(crate::cli::CLITaskQueryError::MissingTaskSpecifier) => {
+                        Ok(Some(PlanRequest::Synthetic(
+                            command.to_synthetic_plan_request(UserCacheConfig::disabled()),
+                        )))
+                    }
+                    Err(err) => Err(err.into()),
+                },
             },
             HandledCommand::Verbatim => Ok(None),
         }
@@ -223,13 +229,52 @@ impl<'a> Session<'a> {
             Command::Cache { ref subcmd } => self.handle_cache_command(subcmd),
             Command::Run(run_command) => {
                 let cwd = Arc::clone(&self.cwd);
-                let plan = self.plan_from_cli(cwd, run_command).await?;
-                let reporter = LabeledReporter::new(std::io::stdout(), self.workspace_path());
-                Ok(self
-                    .execute(plan, Box::new(reporter))
-                    .await
-                    .err()
-                    .unwrap_or(ExitStatus::SUCCESS))
+                let is_interactive =
+                    std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+
+                // Save task name and flags before consuming run_command
+                let task_name = run_command.task_specifier.as_ref().map(|s| s.task_name.clone());
+                let flags = run_command.flags;
+                let additional_args = run_command.additional_args.clone();
+
+                match self.plan_from_cli(cwd, run_command).await {
+                    Ok(plan) if plan.is_empty() => {
+                        // No tasks matched the query — show task selector / "did you mean"
+                        self.handle_no_task(
+                            is_interactive,
+                            task_name.as_deref(),
+                            flags,
+                            additional_args,
+                        )
+                        .await
+                    }
+                    Ok(plan) => {
+                        let reporter =
+                            LabeledReporter::new(std::io::stdout(), self.workspace_path());
+                        Ok(self
+                            .execute(plan, Box::new(reporter))
+                            .await
+                            .err()
+                            .unwrap_or(ExitStatus::SUCCESS))
+                    }
+                    Err(err) if err.is_missing_task_specifier() => {
+                        self.handle_no_task(is_interactive, None, flags, additional_args).await
+                    }
+                    Err(err) => {
+                        if let Some(task_name) = err.task_not_found_name() {
+                            let task_name = task_name.to_owned();
+                            self.handle_no_task(
+                                is_interactive,
+                                Some(&task_name),
+                                flags,
+                                additional_args,
+                            )
+                            .await
+                        } else {
+                            Err(err.into())
+                        }
+                    }
+                }
             }
         }
     }
@@ -243,6 +288,119 @@ impl<'a> Session<'a> {
                 Ok(ExitStatus::SUCCESS)
             }
         }
+    }
+
+    /// Handle the case where no task was specified or a task name was not found.
+    ///
+    /// In interactive mode, shows a fuzzy-searchable selection list.
+    /// In non-interactive mode, prints the task list or "did you mean" suggestions.
+    #[expect(
+        clippy::future_not_send,
+        reason = "session is single-threaded, futures do not need to be Send"
+    )]
+    #[expect(
+        clippy::large_futures,
+        reason = "interactive select future is large but only awaited once"
+    )]
+    async fn handle_no_task(
+        &mut self,
+        is_interactive: bool,
+        not_found_name: Option<&str>,
+        flags: RunFlags,
+        additional_args: Vec<Str>,
+    ) -> anyhow::Result<ExitStatus> {
+        let cwd = Arc::clone(&self.cwd);
+        let task_graph = self.ensure_task_graph_loaded().await?;
+        let current_package_path = task_graph.get_package_path_from_cwd(&cwd).cloned();
+        let mut entries = task_graph.list_tasks();
+        entries.sort_unstable_by(|a, b| {
+            a.task_display
+                .package_name
+                .cmp(&b.task_display.package_name)
+                .then_with(|| a.task_display.task_name.cmp(&b.task_display.task_name))
+        });
+
+        // Build items: current package tasks use unqualified names (no '#'),
+        // other packages use qualified "package#task" names.
+        let select_items: Vec<SelectItem> = entries
+            .iter()
+            .map(|entry| {
+                let label =
+                    if current_package_path.as_ref() == Some(&entry.task_display.package_path) {
+                        entry.task_display.task_name.clone()
+                    } else {
+                        vite_str::format!("{}", entry.task_display)
+                    };
+                SelectItem { label, description: entry.command.clone() }
+            })
+            .collect();
+
+        // Build header: interactive says "not found.", non-interactive "did you mean:" suffix
+        let header = not_found_name.map(|name| {
+            if is_interactive {
+                vite_str::format!("Task \"{name}\" not found.")
+            } else {
+                vite_str::format!("Task \"{name}\" not found. Did you mean:")
+            }
+        });
+
+        // Build mode-dependent params and call select_list once
+        let mut selected_index = if is_interactive { Some(0) } else { None };
+        let mut stdout = std::io::stdout();
+        let mode =
+            selected_index.as_mut().map_or(vite_select::Mode::NonInteractive, |selected_index| {
+                vite_select::Mode::Interactive { selected_index }
+            });
+
+        let params = vite_select::SelectParams {
+            items: &select_items,
+            query: not_found_name,
+            header: header.as_deref(),
+            page_size: 12,
+        };
+
+        vite_select::select_list(
+            &mut stdout,
+            &params,
+            mode,
+            |filtered, query| {
+                // When the query doesn't contain '#', move current-package tasks (those
+                // without '#' in their label) to the top. `sort_by_key` is a stable sort,
+                // so the fuzzy rating order is preserved within each group.
+                if !query.contains('#') {
+                    filtered.sort_by_key(|&idx| select_items[idx].label.contains('#'));
+                }
+            },
+            |state| {
+                use std::io::Write;
+                let milestone_name =
+                    vite_str::format!("task-select:{}:{}", state.query, state.selected_index);
+                let milestone_bytes = pty_terminal_test_client::encoded_milestone(&milestone_name);
+                let mut out = std::io::stdout();
+                let _ = out.write_all(&milestone_bytes);
+                let _ = out.flush();
+            },
+        )?;
+
+        let Some(selected_index) = selected_index else {
+            // Non-interactive: if no task was found, return failure. Otherwise, print the list and return
+            return if not_found_name.is_some() {
+                Ok(ExitStatus::FAILURE)
+            } else {
+                Ok(ExitStatus::SUCCESS)
+            };
+        };
+
+        // Interactive: run the selected task
+        let selected_label = &select_items[selected_index].label;
+        let task_specifier = TaskSpecifier::parse_raw(selected_label);
+        let run_command =
+            RunCommand { task_specifier: Some(task_specifier), flags, additional_args };
+
+        let cwd = Arc::clone(&self.cwd);
+        let plan = self.plan_from_cli(cwd, run_command).await?;
+        let reporter = LabeledReporter::new(std::io::stdout(), self.workspace_path());
+        Ok(self.execute(plan, Box::new(reporter)).await.err().unwrap_or(ExitStatus::SUCCESS))
     }
 
     /// Lazily initializes and returns the execution cache.
@@ -323,15 +481,21 @@ impl<'a> Session<'a> {
         cwd: Arc<AbsolutePath>,
         command: RunCommand,
     ) -> Result<ExecutionPlan, vite_task_plan::Error> {
-        let plan_request = command.into_plan_request(&cwd).map_err(|error| {
-            TaskPlanErrorKind::ParsePlanRequestError {
-                error: error.into(),
-                program: Str::from("vp"),
-                args: Arc::default(),
-                cwd: Arc::clone(&cwd),
+        let plan_request = match command.into_plan_request(&cwd) {
+            Ok(plan_request) => plan_request,
+            Err(crate::cli::CLITaskQueryError::MissingTaskSpecifier) => {
+                return Err(TaskPlanErrorKind::MissingTaskSpecifier.with_empty_call_stack());
             }
-            .with_empty_call_stack()
-        })?;
+            Err(error) => {
+                return Err(TaskPlanErrorKind::ParsePlanRequestError {
+                    error: error.into(),
+                    program: Str::from("vp"),
+                    args: Arc::default(),
+                    cwd: Arc::clone(&cwd),
+                }
+                .with_empty_call_stack());
+            }
+        };
         let plan = ExecutionPlan::plan(
             plan_request,
             &self.workspace_path,

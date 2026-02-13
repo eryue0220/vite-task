@@ -1,0 +1,125 @@
+# Non-interactive: list all tasks (piped stdin forces non-interactive mode)
+[[e2e]]
+name = "non-interactive list tasks"
+steps = [
+  "echo '' | vp run",
+]
+
+# Non-interactive: typo triggers "did you mean"
+[[e2e]]
+name = "non-interactive did you mean"
+steps = [
+  "echo '' | vp run buid",
+]
+
+# Non-interactive: typo with -r flag
+[[e2e]]
+name = "non-interactive did you mean with recursive"
+steps = [
+  "echo '' | vp run -r buid",
+]
+
+# Interactive: navigate down and select second task
+[[e2e]]
+name = "interactive select task"
+cwd = "packages/app"
+steps = [
+  { command = "vp run", interactions = [{ "expect-milestone" = "task-select::0" }, { "write-key" = "down" }, { "expect-milestone" = "task-select::1" }, { "write-key" = "enter" }] },
+]
+
+# Interactive: typo pre-filled in search
+[[e2e]]
+name = "interactive select with typo"
+cwd = "packages/app"
+steps = [
+  { command = "vp run buid", interactions = [{ "expect-milestone" = "task-select:buid:0" }, { "write-key" = "enter" }] },
+]
+
+# Interactive: type to search then select
+[[e2e]]
+name = "interactive search then select"
+cwd = "packages/app"
+steps = [
+  { command = "vp run", interactions = [{ "expect-milestone" = "task-select::0" }, { "write" = "lin" }, { "expect-milestone" = "task-select:lin:0" }, { "write-key" = "enter" }] },
+]
+
+# Interactive: escape clears query and resets filter
+[[e2e]]
+name = "interactive escape clears query"
+cwd = "packages/app"
+steps = [
+  { command = "vp run", interactions = [{ "expect-milestone" = "task-select::0" }, { "write" = "lin" }, { "expect-milestone" = "task-select:lin:0" }, { "write-key" = "escape" }, { "expect-milestone" = "task-select::0" }, { "write-key" = "enter" }] },
+]
+
+# Interactive: -r flag preserved
+[[e2e]]
+name = "interactive select with recursive"
+cwd = "packages/app"
+steps = [
+  { command = "vp run -r", interactions = [{ "expect-milestone" = "task-select::0" }, { "write-key" = "enter" }] },
+]
+
+# Interactive: -t flag + typo
+[[e2e]]
+name = "interactive select with typo and transitive"
+cwd = "packages/app"
+steps = [
+  { command = "vp run -t buid", interactions = [{ "expect-milestone" = "task-select:buid:0" }, { "write-key" = "enter" }] },
+]
+
+# Interactive: scroll down past visible page, then select a task beyond the initial viewport
+[[e2e]]
+name = "interactive scroll long list"
+cwd = "packages/app"
+steps = [
+  { command = "vp run", interactions = [{ "expect-milestone" = "task-select::0" }, # Navigate down to index 8 (past page_size=8, triggering scroll)
+    { "write-key" = "down" },{ "write-key" = "down" },{ "write-key" = "down" },{ "write-key" = "down" },{ "write-key" = "down" },{ "write-key" = "down" },{ "write-key" = "down" },{ "write-key" = "down" },{ "expect-milestone" = "task-select::8" }, # Scroll back up to the top
+    { "write-key" = "up" },{ "write-key" = "up" },{ "write-key" = "up" },{ "write-key" = "up" },{ "write-key" = "up" },{ "write-key" = "up" },{ "write-key" = "up" },{ "write-key" = "up" },{ "expect-milestone" = "task-select::0" },{ "write-key" = "enter" },] },
+]
+
+# Non-interactive: list tasks from lib package (lib tasks first, unqualified)
+[[e2e]]
+name = "non-interactive list tasks from lib"
+cwd = "packages/lib"
+steps = [
+  "echo '' | vp run",
+]
+
+# Interactive: select from lib package (first item is lib's task)
+[[e2e]]
+name = "interactive select task from lib"
+cwd = "packages/lib"
+steps = [
+  { command = "vp run", interactions = [{ "expect-milestone" = "task-select::0" }, { "write-key" = "enter" }] },
+]
+
+# Interactive: search for a task that only exists in another package
+[[e2e]]
+name = "interactive search other package task"
+cwd = "packages/app"
+steps = [
+  { command = "vp run", interactions = [{ "expect-milestone" = "task-select::0" }, { "write" = "typec" }, { "expect-milestone" = "task-select:typec:0" }, { "write-key" = "enter" }] },
+]
+
+# Interactive: '#' in query skips current-package reordering
+[[e2e]]
+name = "interactive search with hash skips reorder"
+cwd = "packages/app"
+steps = [
+  { command = "vp run", interactions = [{ "expect-milestone" = "task-select::0" }, { "write" = "lib#" }, { "expect-milestone" = "task-select:lib#:0" }, { "write-key" = "enter" }] },
+]
+
+# Interactive: multiple current-package matches preserve fuzzy rating order
+[[e2e]]
+name = "interactive search preserves rating within package"
+cwd = "packages/lib"
+steps = [
+  { command = "vp run", interactions = [{ "expect-milestone" = "task-select::0" }, { "write" = "t" }, { "expect-milestone" = "task-select:t:0" }, { "write-key" = "enter" }] },
+]
+
+# Typo inside a task script should fail with an error, NOT show a list
+[[e2e]]
+name = "typo in task script fails without list"
+steps = [
+  "vp run run-typo-task",
+]

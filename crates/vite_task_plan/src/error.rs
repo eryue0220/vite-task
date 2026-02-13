@@ -134,6 +134,9 @@ pub enum TaskPlanErrorKind {
 
     #[error("Failed to resolve environment variables")]
     ResolveEnvError(#[source] ResolveEnvError),
+
+    #[error("No task specifier provided for 'run' command")]
+    MissingTaskSpecifier,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -158,6 +161,32 @@ impl TaskPlanErrorKind {
     #[must_use]
     pub fn with_empty_call_stack(self) -> Error {
         Error { task_call_stack: TaskCallStackDisplay::default(), kind: self }
+    }
+}
+
+impl Error {
+    #[must_use]
+    pub const fn is_missing_task_specifier(&self) -> bool {
+        matches!(self.kind, TaskPlanErrorKind::MissingTaskSpecifier)
+    }
+
+    /// If this error represents a top-level task-not-found lookup failure,
+    /// returns the task name that the user typed.
+    ///
+    /// Returns `None` if the error occurred in a nested task (non-empty call stack),
+    /// since nested task errors should propagate as-is rather than triggering
+    /// interactive task selection.
+    #[must_use]
+    pub fn task_not_found_name(&self) -> Option<&str> {
+        if !self.task_call_stack.is_empty() {
+            return None;
+        }
+        match &self.kind {
+            TaskPlanErrorKind::TaskQueryError(
+                vite_task_graph::query::TaskQueryError::SpecifierLookupError { specifier, .. },
+            ) => Some(specifier.task_name.as_str()),
+            _ => None,
+        }
     }
 }
 
