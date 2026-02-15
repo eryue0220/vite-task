@@ -1,15 +1,11 @@
 pub mod fingerprint;
 pub mod spawn;
 
-use std::sync::Arc;
+use std::{process::Stdio, sync::Arc};
 
 use futures_util::FutureExt;
-use petgraph::{algo::toposort, stable_graph::StableGraph};
 use vite_path::AbsolutePath;
-use vite_task_plan::{
-    ExecutionItemKind, ExecutionPlan, LeafExecutionKind, SpawnExecution, TaskExecution,
-    execution_graph::ExecutionIx,
-};
+use vite_task_plan::{ExecutionGraph, ExecutionItemKind, LeafExecutionKind, SpawnExecution};
 
 use self::{
     fingerprint::PostRunFingerprint,
@@ -18,401 +14,354 @@ use self::{
 use super::{
     cache::{CommandCacheValue, ExecutionCache},
     event::{
-        CacheDisabledReason, CacheNotUpdatedReason, CacheStatus, CacheUpdateStatus, ExecutionEvent,
-        ExecutionEventKind, ExecutionId, ExecutionItemDisplay, OutputKind,
+        CacheDisabledReason, CacheNotUpdatedReason, CacheStatus, CacheUpdateStatus, OutputKind,
     },
-    reporter::{ExitStatus, Reporter},
+    reporter::{
+        ExitStatus, GraphExecutionReporter, GraphExecutionReporterBuilder, LeafExecutionPath,
+        LeafExecutionReporter, StdinSuggestion,
+    },
 };
 use crate::{Session, session::execute::spawn::SpawnTrackResult};
 
-/// Internal error type used to abort execution when errors occur.
-/// This error is swallowed in `Session::execute` and never exposed externally.
-#[derive(Debug)]
-struct ExecutionAborted;
+/// Outcome of a spawned execution.
+///
+/// Returned by [`execute_spawn`] to communicate what happened. Errors are
+/// already reported through `LeafExecutionReporter::finish()` before this
+/// value is returned — the caller does not need to handle error display.
+pub enum SpawnOutcome {
+    /// Cache hit — no process was spawned. Cached outputs were replayed.
+    CacheHit,
+    /// Process was spawned and exited with this status.
+    Spawned(std::process::ExitStatus),
+    /// An infrastructure error prevented the process from running
+    /// (cache lookup failure or spawn failure).
+    /// Already reported through the leaf reporter.
+    Failed,
+}
 
+/// Holds mutable references needed during graph execution.
+///
+/// The `reporter` field is used to create leaf reporters for individual executions.
+/// Cache fields are passed through to [`execute_spawn`] for cache-aware execution.
 struct ExecutionContext<'a> {
-    event_handler: &'a mut dyn Reporter,
-    current_execution_id: ExecutionId,
+    /// The graph-level reporter, used to create leaf reporters via `new_leaf_execution()`.
+    reporter: &'a mut dyn GraphExecutionReporter,
+    /// The execution cache for looking up and storing cached results.
     cache: &'a ExecutionCache,
-    /// All relative paths in cache are relative to this base path
+    /// Base path for resolving relative paths in cache entries.
+    /// Typically the workspace root.
     cache_base_path: &'a Arc<AbsolutePath>,
 }
 
 impl ExecutionContext<'_> {
+    /// Execute all tasks in an execution graph in dependency order.
+    ///
+    /// `ExecutionGraph` guarantees acyclicity at construction time and caches a
+    /// topological order. We iterate `toposort()` in reverse to get execution order
+    /// (dependencies before dependents).
+    ///
+    /// The `path_prefix` tracks our position within nested execution graphs. For the
+    /// root call this is an empty path; for nested `Expanded` items it carries the
+    /// path so far.
+    /// Leaf-level errors are reported through the reporter and do not abort the graph.
+    /// Cycle detection is handled at plan time, so this function cannot encounter cycles.
     #[expect(clippy::future_not_send, reason = "uses !Send types internally")]
-    async fn execute_item_kind(
+    async fn execute_expanded_graph(
         &mut self,
-        display: Option<&ExecutionItemDisplay>,
-        item_kind: &ExecutionItemKind,
-    ) -> Result<(), ExecutionAborted> {
-        match item_kind {
-            ExecutionItemKind::Expanded(graph) => {
-                // Use StableGraph to preserve node indices during removal
-                let mut graph: StableGraph<&TaskExecution, (), _, ExecutionIx> =
-                    graph.map(|_, task_execution| task_execution, |_, ()| ()).into();
+        graph: &ExecutionGraph,
+        path_prefix: &LeafExecutionPath,
+    ) {
+        // `toposort()` returns nodes in topological order: for every edge A→B,
+        // A appears before B. Since our edges mean "A depends on B", dependencies
+        // (B) appear after their dependents (A). We iterate in reverse to get
+        // execution order where dependencies run first.
 
-                // To be consistent with the package graph in vite_package_manager and the dependency graph definition in Wikipedia
-                // https://en.wikipedia.org/wiki/Dependency_graph, we construct the graph with edges from dependents to dependencies
-                // e.g. A -> B means A depends on B
-                //
-                // For execution we need to reverse the edges first before topological sorting,
-                // so that tasks without dependencies are executed first
-                graph.reverse(); // Run tasks without dependencies first
+        // Execute tasks in dependency-first order. Each task may have multiple items
+        // (from `&&`-split commands), which are executed sequentially.
+        for &node_ix in graph.toposort().iter().rev() {
+            let task_execution = &graph[node_ix];
 
-                // Always use topological sort to ensure the correct order of execution
-                // or the task dependencies declaration is meaningless
-                let node_indices = match toposort(&graph, None) {
-                    Ok(ok) => ok,
-                    Err(cycle) => {
-                        // Follow standard error pattern: Start event, then Error event
-                        let execution_id = self.current_execution_id;
-                        self.current_execution_id = self.current_execution_id.next();
+            for (item_idx, item) in task_execution.items.iter().enumerate() {
+                // Build the path for this item by appending to the prefix
+                let mut item_path = path_prefix.clone();
+                item_path.push(node_ix, item_idx);
 
-                        // Emit Start event for cycle detection error
-                        // display is None for top-level execution (no parent task)
-                        // display is Some for nested execution (within a parent task)
-                        // Caching is disabled when cycle dependencies are detected
-                        self.event_handler.handle_event(ExecutionEvent {
-                            execution_id,
-                            kind: ExecutionEventKind::Start {
-                                display: display.cloned(),
-                                cache_status: CacheStatus::Disabled(
-                                    CacheDisabledReason::CycleDetected,
-                                ),
-                            },
-                        });
-
-                        self.event_handler.handle_event(ExecutionEvent {
-                            execution_id,
-                            kind: ExecutionEventKind::Error {
-                                message: vite_str::format!(
-                                    "Cycle dependencies detected: {cycle:?}"
-                                ),
-                            },
-                        });
-
-                        return Err(ExecutionAborted);
+                match &item.kind {
+                    ExecutionItemKind::Leaf(leaf_kind) => {
+                        self.execute_leaf(&item_path, leaf_kind).boxed_local().await;
                     }
-                };
-
-                let ordered_executions =
-                    node_indices.into_iter().map(|id| graph.remove_node(id).unwrap());
-                for task_execution in ordered_executions {
-                    for item in &task_execution.items {
-                        match &item.kind {
-                            ExecutionItemKind::Leaf(leaf_kind) => {
-                                self.execute_leaf(Some(&item.execution_item_display), leaf_kind)
-                                    .boxed_local()
-                                    .await?;
-                            }
-                            ExecutionItemKind::Expanded(_) => {
-                                self.execute_item_kind(
-                                    Some(&item.execution_item_display),
-                                    &item.kind,
-                                )
-                                .boxed_local()
-                                .await?;
-                            }
-                        }
+                    ExecutionItemKind::Expanded(nested_graph) => {
+                        // Recurse into the nested graph, carrying the path prefix forward.
+                        self.execute_expanded_graph(nested_graph, &item_path).boxed_local().await;
                     }
                 }
             }
-            ExecutionItemKind::Leaf(leaf_execution_kind) => {
-                #[expect(
-                    clippy::large_futures,
-                    reason = "recursive execution creates large futures"
-                )]
-                self.execute_leaf(display, leaf_execution_kind).await?;
-            }
         }
-        Ok(())
     }
 
+    /// Execute a single leaf item (in-process command or spawned process).
+    ///
+    /// Creates a [`LeafExecutionReporter`] from the graph reporter and delegates
+    /// to the appropriate execution method.
     #[expect(clippy::future_not_send, reason = "uses !Send types internally")]
     async fn execute_leaf(
         &mut self,
-        display: Option<&ExecutionItemDisplay>,
+        path: &LeafExecutionPath,
         leaf_execution_kind: &LeafExecutionKind,
-    ) -> Result<(), ExecutionAborted> {
-        let execution_id = self.current_execution_id;
-        self.current_execution_id = self.current_execution_id.next();
+    ) {
+        let mut leaf_reporter = self.reporter.new_leaf_execution(path);
 
         match leaf_execution_kind {
             LeafExecutionKind::InProcess(in_process_execution) => {
-                // Emit Start event with cache_status for in-process (built-in) commands
-                // Caching is disabled for built-in commands
-                self.event_handler.handle_event(ExecutionEvent {
-                    execution_id,
-                    kind: ExecutionEventKind::Start {
-                        display: display.cloned(),
-                        cache_status: CacheStatus::Disabled(
-                            CacheDisabledReason::InProcessExecution,
-                        ),
-                    },
-                });
+                // In-process (built-in) commands: caching is disabled, execute synchronously
+                leaf_reporter.start(CacheStatus::Disabled(CacheDisabledReason::InProcessExecution));
 
-                // Execute the in-process command
                 let execution_output = in_process_execution.execute();
-                self.event_handler.handle_event(ExecutionEvent {
-                    execution_id,
-                    kind: ExecutionEventKind::Output {
-                        kind: OutputKind::Stdout,
-                        content: execution_output.stdout.into(),
-                    },
-                });
+                leaf_reporter.output(OutputKind::Stdout, execution_output.stdout.into());
 
-                // Emit Finish with CacheDisabled status (in-process executions don't cache)
-                self.event_handler.handle_event(ExecutionEvent {
-                    execution_id,
-                    kind: ExecutionEventKind::Finish {
-                        status: None,
-                        cache_update_status: CacheUpdateStatus::NotUpdated(
-                            CacheNotUpdatedReason::CacheDisabled,
-                        ),
-                    },
-                });
+                leaf_reporter.finish(
+                    None,
+                    CacheUpdateStatus::NotUpdated(CacheNotUpdatedReason::CacheDisabled),
+                    None,
+                );
             }
             LeafExecutionKind::Spawn(spawn_execution) => {
                 #[expect(
                     clippy::large_futures,
                     reason = "spawn execution with cache management creates large futures"
                 )]
-                self.execute_spawn(execution_id, display, spawn_execution).await?;
+                let _ =
+                    execute_spawn(leaf_reporter, spawn_execution, self.cache, self.cache_base_path)
+                        .await;
             }
         }
-        Ok(())
-    }
-
-    #[expect(clippy::future_not_send, reason = "uses !Send types internally")]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "sequential cache check, execute, and update steps are clearer in one function"
-    )]
-    async fn execute_spawn(
-        &mut self,
-        execution_id: ExecutionId,
-        display: Option<&ExecutionItemDisplay>,
-        spawn_execution: &SpawnExecution,
-    ) -> Result<(), ExecutionAborted> {
-        let cache_metadata = spawn_execution.cache_metadata.as_ref();
-
-        // 1. Determine cache status FIRST by trying cache hit
-        //    We need to know the status before emitting Start event so users
-        //    see cache status immediately when execution begins
-        let (cache_status, cached_value) = if let Some(cache_metadata) = cache_metadata {
-            match self.cache.try_hit(cache_metadata, self.cache_base_path).await {
-                Ok(Ok(cached)) => (
-                    // Cache hit - we can replay the cached outputs
-                    CacheStatus::Hit { replayed_duration: cached.duration },
-                    Some(cached),
-                ),
-                Ok(Err(cache_miss)) => (
-                    // Cache miss - includes detailed reason (NotFound or FingerprintMismatch)
-                    CacheStatus::Miss(cache_miss),
-                    None,
-                ),
-                Err(err) => {
-                    // Cache lookup error - emit error and abort
-                    self.event_handler.handle_event(ExecutionEvent {
-                        execution_id,
-                        kind: ExecutionEventKind::Error {
-                            message: vite_str::format!("Cache lookup failed: {err}"),
-                        },
-                    });
-                    return Err(ExecutionAborted);
-                }
-            }
-        } else {
-            // No cache metadata provided - caching is disabled for this task
-            (CacheStatus::Disabled(CacheDisabledReason::NoCacheMetadata), None)
-        };
-
-        // 2. NOW emit Start event with cache_status (ALWAYS emit Start)
-        //    This ensures all spawn executions emit Start, including cache hits
-        //    (previously cache hits didn't emit Start at all)
-        self.event_handler.handle_event(ExecutionEvent {
-            execution_id,
-            kind: ExecutionEventKind::Start { display: display.cloned(), cache_status },
-        });
-
-        // 3. If cache hit, replay outputs and return early
-        //    No need to actually execute the command - just replay what was cached
-        if let Some(cached) = cached_value {
-            for output in cached.std_outputs.iter() {
-                self.event_handler.handle_event(ExecutionEvent {
-                    execution_id,
-                    kind: ExecutionEventKind::Output {
-                        kind: match output.kind {
-                            SpawnOutputKind::StdOut => OutputKind::Stdout,
-                            SpawnOutputKind::StdErr => OutputKind::Stderr,
-                        },
-                        content: output.content.clone().into(),
-                    },
-                });
-            }
-            // Emit Finish with CacheHit status (no cache update needed)
-            self.event_handler.handle_event(ExecutionEvent {
-                execution_id,
-                kind: ExecutionEventKind::Finish {
-                    status: None,
-                    cache_update_status: CacheUpdateStatus::NotUpdated(
-                        CacheNotUpdatedReason::CacheHit,
-                    ),
-                },
-            });
-            return Ok(());
-        }
-
-        // 4. Execute spawn (cache miss or disabled)
-        //    Track file system access if caching is enabled (for future cache updates)
-        let mut track_result_with_cache_metadata =
-            cache_metadata.map(|cache_metadata| (SpawnTrackResult::default(), cache_metadata));
-
-        // Execute command with tracking, emitting output events in real-time
-        #[expect(
-            clippy::large_futures,
-            reason = "spawn_with_tracking manages process I/O and creates a large future"
-        )]
-        let result = match spawn_with_tracking(
-            &spawn_execution.spawn_command,
-            self.cache_base_path,
-            |kind, content| {
-                self.event_handler.handle_event(ExecutionEvent {
-                    execution_id,
-                    kind: ExecutionEventKind::Output {
-                        kind: match kind {
-                            SpawnOutputKind::StdOut => OutputKind::Stdout,
-                            SpawnOutputKind::StdErr => OutputKind::Stderr,
-                        },
-                        content,
-                    },
-                });
-            },
-            track_result_with_cache_metadata.as_mut().map(|(track_result, _)| track_result),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                self.event_handler.handle_event(ExecutionEvent {
-                    execution_id,
-                    kind: ExecutionEventKind::Error {
-                        message: vite_str::format!("Failed to spawn process: {err}"),
-                    },
-                });
-                return Err(ExecutionAborted);
-            }
-        };
-
-        // 5. Update cache if successful and determine cache update status
-        let cache_update_status = if let Some((track_result, cache_metadata)) =
-            track_result_with_cache_metadata
-        {
-            if result.exit_status.success() {
-                // Execution succeeded, attempt cache update
-                let fingerprint_ignores = cache_metadata
-                    .spawn_fingerprint
-                    .fingerprint_ignores()
-                    .map(std::vec::Vec::as_slice);
-                match PostRunFingerprint::create(
-                    &track_result.path_reads,
-                    self.cache_base_path,
-                    fingerprint_ignores,
-                ) {
-                    Ok(post_run_fingerprint) => {
-                        let new_cache_value = CommandCacheValue {
-                            post_run_fingerprint,
-                            std_outputs: track_result.std_outputs.clone().into(),
-                            duration: result.duration,
-                        };
-                        if let Err(err) = self.cache.update(cache_metadata, new_cache_value).await {
-                            self.event_handler.handle_event(ExecutionEvent {
-                                execution_id,
-                                kind: ExecutionEventKind::Error {
-                                    message: vite_str::format!("Failed to update cache: {err}"),
-                                },
-                            });
-                            return Err(ExecutionAborted);
-                        }
-                        CacheUpdateStatus::Updated
-                    }
-                    Err(err) => {
-                        self.event_handler.handle_event(ExecutionEvent {
-                            execution_id,
-                            kind: ExecutionEventKind::Error {
-                                message: vite_str::format!(
-                                    "Failed to create post-run fingerprint: {err}"
-                                ),
-                            },
-                        });
-                        return Err(ExecutionAborted);
-                    }
-                }
-            } else {
-                // Execution failed with non-zero exit status, don't update cache
-                CacheUpdateStatus::NotUpdated(CacheNotUpdatedReason::NonZeroExitStatus)
-            }
-        } else {
-            // Caching was disabled for this task
-            CacheUpdateStatus::NotUpdated(CacheNotUpdatedReason::CacheDisabled)
-        };
-
-        // 6. Emit finish with cache_update_status
-        self.event_handler.handle_event(ExecutionEvent {
-            execution_id,
-            kind: ExecutionEventKind::Finish {
-                status: Some(result.exit_status),
-                cache_update_status,
-            },
-        });
-
-        Ok(())
     }
 }
 
+/// Execute a spawned process with cache-aware lifecycle.
+///
+/// This is a free function (not tied to `ExecutionContext`) so it can be reused
+/// from both graph-based execution and standalone synthetic execution.
+///
+/// The full lifecycle is:
+/// 1. Cache lookup (determines cache status)
+/// 2. `leaf_reporter.start(cache_status)`
+/// 3. If cache hit: replay cached outputs → finish
+/// 4. If cache miss/disabled: spawn process → stream output → update cache → finish
+///
+/// Errors (cache lookup failure, spawn failure, cache update failure) are reported
+/// through `leaf_reporter.finish()` and do not abort the caller.
+#[expect(clippy::future_not_send, reason = "uses !Send types internally")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential cache check, execute, and update steps are clearer in one function"
+)]
+pub async fn execute_spawn(
+    mut leaf_reporter: Box<dyn LeafExecutionReporter>,
+    spawn_execution: &SpawnExecution,
+    cache: &ExecutionCache,
+    cache_base_path: &Arc<AbsolutePath>,
+) -> SpawnOutcome {
+    let cache_metadata = spawn_execution.cache_metadata.as_ref();
+
+    // 1. Determine cache status FIRST by trying cache hit.
+    //    We need to know the status before calling start() so the reporter
+    //    can display cache status immediately when execution begins.
+    let (cache_status, cached_value) = if let Some(cache_metadata) = cache_metadata {
+        match cache.try_hit(cache_metadata, cache_base_path).await {
+            Ok(Ok(cached)) => (
+                // Cache hit — we can replay the cached outputs
+                CacheStatus::Hit { replayed_duration: cached.duration },
+                Some(cached),
+            ),
+            Ok(Err(cache_miss)) => (
+                // Cache miss — includes detailed reason (NotFound or FingerprintMismatch)
+                CacheStatus::Miss(cache_miss),
+                None,
+            ),
+            Err(err) => {
+                // Cache lookup error — report through finish.
+                // Note: start() is NOT called because we don't have a valid cache status.
+                leaf_reporter.finish(
+                    None,
+                    CacheUpdateStatus::NotUpdated(CacheNotUpdatedReason::CacheDisabled),
+                    Some(vite_str::format!("Cache lookup failed: {err}")),
+                );
+                return SpawnOutcome::Failed;
+            }
+        }
+    } else {
+        // No cache metadata provided — caching is disabled for this task
+        (CacheStatus::Disabled(CacheDisabledReason::NoCacheMetadata), None)
+    };
+
+    // 2. Report execution start with the determined cache status
+    leaf_reporter.start(cache_status);
+
+    // 3. If cache hit, replay outputs and finish early.
+    //    No need to actually execute the command — just replay what was cached.
+    if let Some(cached) = cached_value {
+        for output in cached.std_outputs.iter() {
+            leaf_reporter.output(
+                match output.kind {
+                    SpawnOutputKind::StdOut => OutputKind::Stdout,
+                    SpawnOutputKind::StdErr => OutputKind::Stderr,
+                },
+                output.content.clone().into(),
+            );
+        }
+        leaf_reporter.finish(
+            None,
+            CacheUpdateStatus::NotUpdated(CacheNotUpdatedReason::CacheHit),
+            None,
+        );
+        return SpawnOutcome::CacheHit;
+    }
+
+    // 4. Execute spawn (cache miss or disabled).
+    //    Track file system access if caching is enabled (for future cache updates).
+    let mut track_result_with_cache_metadata =
+        cache_metadata.map(|cache_metadata| (SpawnTrackResult::default(), cache_metadata));
+
+    // Determine the child process's stdin mode based on:
+    // - The reporter's suggestion (inherited only when appropriate, e.g., single task)
+    // - Whether caching is disabled (inherited stdin would make output non-deterministic,
+    //   breaking cache semantics)
+    let stdin = if leaf_reporter.stdin_suggestion() == StdinSuggestion::Inherited
+        && cache_metadata.is_none()
+    {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    };
+
+    // Execute command with tracking, streaming output in real-time via the reporter
+    #[expect(
+        clippy::large_futures,
+        reason = "spawn_with_tracking manages process I/O and creates a large future"
+    )]
+    let result = match spawn_with_tracking(
+        &spawn_execution.spawn_command,
+        cache_base_path,
+        stdin,
+        |kind, content| {
+            leaf_reporter.output(
+                match kind {
+                    SpawnOutputKind::StdOut => OutputKind::Stdout,
+                    SpawnOutputKind::StdErr => OutputKind::Stderr,
+                },
+                content,
+            );
+        },
+        track_result_with_cache_metadata.as_mut().map(|(track_result, _)| track_result),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            leaf_reporter.finish(
+                None,
+                CacheUpdateStatus::NotUpdated(CacheNotUpdatedReason::CacheDisabled),
+                Some(vite_str::format!("Failed to spawn process: {err}")),
+            );
+            return SpawnOutcome::Failed;
+        }
+    };
+
+    // 5. Update cache if successful and determine cache update status.
+    //    Errors during cache update are terminal (reported through finish).
+    let (cache_update_status, cache_error) = if let Some((track_result, cache_metadata)) =
+        track_result_with_cache_metadata
+    {
+        if result.exit_status.success() {
+            // Execution succeeded — attempt to create fingerprint and update cache
+            let fingerprint_ignores =
+                cache_metadata.spawn_fingerprint.fingerprint_ignores().map(std::vec::Vec::as_slice);
+            match PostRunFingerprint::create(
+                &track_result.path_reads,
+                cache_base_path,
+                fingerprint_ignores,
+            ) {
+                Ok(post_run_fingerprint) => {
+                    let new_cache_value = CommandCacheValue {
+                        post_run_fingerprint,
+                        std_outputs: track_result.std_outputs.clone().into(),
+                        duration: result.duration,
+                    };
+                    match cache.update(cache_metadata, new_cache_value).await {
+                        Ok(()) => (CacheUpdateStatus::Updated, None),
+                        Err(err) => (
+                            CacheUpdateStatus::NotUpdated(CacheNotUpdatedReason::CacheDisabled),
+                            Some(vite_str::format!("Failed to update cache: {err}")),
+                        ),
+                    }
+                }
+                Err(err) => (
+                    CacheUpdateStatus::NotUpdated(CacheNotUpdatedReason::CacheDisabled),
+                    Some(vite_str::format!("Failed to create post-run fingerprint: {err}")),
+                ),
+            }
+        } else {
+            // Execution failed with non-zero exit status — don't update cache
+            (CacheUpdateStatus::NotUpdated(CacheNotUpdatedReason::NonZeroExitStatus), None)
+        }
+    } else {
+        // Caching was disabled for this task
+        (CacheUpdateStatus::NotUpdated(CacheNotUpdatedReason::CacheDisabled), None)
+    };
+
+    // 6. Finish the leaf execution with the result and optional cache error.
+    //    Cache update/fingerprint failures are reported but do not affect the outcome —
+    //    the process ran, so we return its actual exit status.
+    leaf_reporter.finish(Some(result.exit_status), cache_update_status, cache_error);
+
+    SpawnOutcome::Spawned(result.exit_status)
+}
+
 impl Session<'_> {
-    /// Execute an execution plan, reporting events to the provided reporter.
+    /// Execute an execution graph, reporting events through the provided reporter builder.
     ///
-    /// Returns Err(ExitStatus) to suggest the caller to abort and exit the process with the given exit status.
+    /// Cache is initialized only if any leaf execution needs it. The reporter is built
+    /// after cache initialization, so cache errors are reported directly to stderr
+    /// without involving the reporter at all.
     ///
-    /// The return type isn't just `ExitStatus` because we want to distinguish between normal successful execution,
-    /// and execution that failed and needs to exit with a specific code which can be zero.
+    /// Returns `Err(ExitStatus)` to indicate the caller should exit with the given status code.
+    /// Returns `Ok(())` when all tasks succeeded.
     #[expect(clippy::future_not_send, reason = "uses !Send types internally")]
-    pub(crate) async fn execute(
+    pub(crate) async fn execute_graph(
         &self,
-        plan: ExecutionPlan,
-        mut reporter: Box<dyn Reporter>,
+        execution_graph: ExecutionGraph,
+        builder: Box<dyn GraphExecutionReporterBuilder>,
     ) -> Result<(), ExitStatus> {
-        // Lazily initialize the cache on first execution
+        // Initialize cache before building the reporter. Cache errors are reported
+        // directly to stderr and cause an early exit, keeping the reporter flow clean
+        // (the reporter's `finish()` no longer accepts graph-level error messages).
         let cache = match self.cache() {
             Ok(cache) => cache,
+            #[expect(clippy::print_stderr, reason = "cache init errors bypass the reporter")]
             Err(err) => {
-                reporter.handle_event(ExecutionEvent {
-                    execution_id: ExecutionId::zero(),
-                    kind: ExecutionEventKind::Error {
-                        message: vite_str::format!("Failed to initialize cache: {err}"),
-                    },
-                });
-                return Err(ExitStatus(1));
+                eprintln!("Failed to initialize cache: {err}");
+                return Err(ExitStatus::FAILURE);
             }
         };
 
+        // Wrap the graph in Arc so both the reporter and execution can reference it.
+        // The reporter clones the Arc internally for display lookups.
+        let graph = Arc::new(execution_graph);
+        let mut reporter = builder.build(&graph);
+
         let mut execution_context = ExecutionContext {
-            event_handler: &mut *reporter,
-            current_execution_id: ExecutionId::zero(),
+            reporter: &mut *reporter,
             cache,
             cache_base_path: &self.workspace_path,
         };
 
-        // Execute and swallow ExecutionAborted error
-        // display is None for top-level execution
-        #[expect(
-            clippy::large_futures,
-            reason = "top-level execution dispatches the entire task graph"
-        )]
-        let _ = execution_context.execute_item_kind(None, plan.root_node()).await;
+        // Execute the graph. Leaf-level errors are reported through the reporter
+        // and do not abort the graph. Cycle detection is handled at plan time.
+        execution_context.execute_expanded_graph(&graph, &LeafExecutionPath::default()).await;
 
-        // Always call post_execution, whether execution succeeded or failed
-        reporter.post_execution()
+        // Leaf-level errors and non-zero exit statuses are tracked internally
+        // by the reporter.
+        reporter.finish()
     }
 }

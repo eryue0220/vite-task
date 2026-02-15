@@ -8,10 +8,9 @@ use std::{ffi::OsStr, fmt::Debug, io::IsTerminal, sync::Arc};
 
 use cache::ExecutionCache;
 pub use cache::{CacheMiss, FingerprintMismatch};
-pub use event::ExecutionEvent;
 use once_cell::sync::OnceCell;
 pub use reporter::ExitStatus;
-use reporter::LabeledReporter;
+use reporter::LabeledReporterBuilder;
 use rustc_hash::FxHashMap;
 use vite_path::{AbsolutePath, AbsolutePathBuf};
 use vite_select::SelectItem;
@@ -21,7 +20,7 @@ use vite_task_graph::{
     loader::UserConfigLoader,
 };
 use vite_task_plan::{
-    ExecutionPlan, TaskGraphLoader,
+    ExecutionGraph, ExecutionPlan, TaskGraphLoader,
     plan_request::{PlanRequest, ScriptCommand, SyntheticPlanRequest},
     prepend_path_env,
 };
@@ -102,15 +101,17 @@ impl vite_task_plan::PlanRequestParser for PlanRequestParser<'_> {
                 Command::Cache { .. } => Ok(Some(PlanRequest::Synthetic(
                     command.to_synthetic_plan_request(UserCacheConfig::disabled()),
                 ))),
-                Command::Run(run_command) => match run_command.into_plan_request(&command.cwd) {
-                    Ok(plan_request) => Ok(Some(plan_request)),
-                    Err(crate::cli::CLITaskQueryError::MissingTaskSpecifier) => {
-                        Ok(Some(PlanRequest::Synthetic(
-                            command.to_synthetic_plan_request(UserCacheConfig::disabled()),
-                        )))
+                Command::Run(run_command) => {
+                    match run_command.into_query_plan_request(&command.cwd) {
+                        Ok(query_plan_request) => Ok(Some(PlanRequest::Query(query_plan_request))),
+                        Err(crate::cli::CLITaskQueryError::MissingTaskSpecifier) => {
+                            Ok(Some(PlanRequest::Synthetic(
+                                command.to_synthetic_plan_request(UserCacheConfig::disabled()),
+                            )))
+                        }
+                        Err(err) => Err(err.into()),
                     }
-                    Err(err) => Err(err.into()),
-                },
+                }
             },
             HandledCommand::Verbatim => Ok(None),
         }
@@ -220,10 +221,6 @@ impl<'a> Session<'a> {
         clippy::future_not_send,
         reason = "session is single-threaded, futures do not need to be Send"
     )]
-    #[expect(
-        clippy::large_futures,
-        reason = "execution plan future is large but only awaited once"
-    )]
     pub async fn main(mut self, command: Command) -> anyhow::Result<ExitStatus> {
         match command {
             Command::Cache { ref subcmd } => self.handle_cache_command(subcmd),
@@ -237,8 +234,8 @@ impl<'a> Session<'a> {
                 let flags = run_command.flags;
                 let additional_args = run_command.additional_args.clone();
 
-                match self.plan_from_cli(cwd, run_command).await {
-                    Ok(plan) if plan.is_empty() => {
+                match self.plan_from_cli_run(cwd, run_command).await {
+                    Ok(ref graph) if graph.node_count() == 0 => {
                         // No tasks matched the query — show task selector / "did you mean"
                         self.handle_no_task(
                             is_interactive,
@@ -248,11 +245,11 @@ impl<'a> Session<'a> {
                         )
                         .await
                     }
-                    Ok(plan) => {
-                        let reporter =
-                            LabeledReporter::new(std::io::stdout(), self.workspace_path());
+                    Ok(graph) => {
+                        let builder =
+                            LabeledReporterBuilder::new(std::io::stdout(), self.workspace_path());
                         Ok(self
-                            .execute(plan, Box::new(reporter))
+                            .execute_graph(graph, Box::new(builder))
                             .await
                             .err()
                             .unwrap_or(ExitStatus::SUCCESS))
@@ -297,10 +294,6 @@ impl<'a> Session<'a> {
     #[expect(
         clippy::future_not_send,
         reason = "session is single-threaded, futures do not need to be Send"
-    )]
-    #[expect(
-        clippy::large_futures,
-        reason = "interactive select future is large but only awaited once"
     )]
     async fn handle_no_task(
         &mut self,
@@ -398,9 +391,9 @@ impl<'a> Session<'a> {
             RunCommand { task_specifier: Some(task_specifier), flags, additional_args };
 
         let cwd = Arc::clone(&self.cwd);
-        let plan = self.plan_from_cli(cwd, run_command).await?;
-        let reporter = LabeledReporter::new(std::io::stdout(), self.workspace_path());
-        Ok(self.execute(plan, Box::new(reporter)).await.err().unwrap_or(ExitStatus::SUCCESS))
+        let graph = self.plan_from_cli_run(cwd, run_command).await?;
+        let builder = LabeledReporterBuilder::new(std::io::stdout(), self.workspace_path());
+        Ok(self.execute_graph(graph, Box::new(builder)).await.err().unwrap_or(ExitStatus::SUCCESS))
     }
 
     /// Lazily initializes and returns the execution cache.
@@ -435,8 +428,15 @@ impl<'a> Session<'a> {
 
     /// Execute a synthetic command with cache support.
     ///
-    /// This is for executing a command with cache before/without the entrypoint [`Session::main`].
-    /// In vite-plus, this is used for auto-install.
+    /// This is for executing a single command with cache before/without the entrypoint
+    /// [`Session::main`]. In vite-plus, this is used for auto-install.
+    ///
+    /// Unlike `execute_graph` which uses the full graph reporter
+    /// pipeline, this method uses a `PlainReporter` — a lightweight reporter with no
+    /// summary, no stats tracking, and no graph awareness.
+    ///
+    /// The exit status is determined from the `execute_spawn` return value, not from
+    /// the reporter.
     ///
     /// # Errors
     ///
@@ -455,16 +455,52 @@ impl<'a> Session<'a> {
         cache_key: Arc<[Str]>,
         silent_if_cache_hit: bool,
     ) -> anyhow::Result<ExitStatus> {
-        let plan = ExecutionPlan::plan_synthetic(
+        // Plan the synthetic execution — returns a SpawnExecution directly
+        // (synthetic plans are always a single spawned process)
+        let execution_plan = ExecutionPlan::plan_synthetic(
             &self.workspace_path,
             &self.cwd,
             synthetic_plan_request,
             cache_key,
         )?;
-        let mut reporter = LabeledReporter::new(std::io::stdout(), self.workspace_path());
-        reporter.set_hide_summary(true);
-        reporter.set_silent_if_cache_hit(silent_if_cache_hit);
-        Ok(self.execute(plan, Box::new(reporter)).await.err().unwrap_or(ExitStatus::SUCCESS))
+        let vite_task_plan::ExecutionItemKind::Leaf(vite_task_plan::LeafExecutionKind::Spawn(
+            spawn_execution,
+        )) = execution_plan.into_root_node()
+        else {
+            unreachable!("plan_synthetic always produces a Leaf(Spawn(..)) node")
+        };
+
+        // Initialize cache (needed for cache-aware execution)
+        let cache = self.cache()?;
+
+        // Create a plain (standalone) reporter — no graph awareness, no summary
+        let plain_reporter = reporter::PlainReporter::new(std::io::stdout(), silent_if_cache_hit);
+
+        // Execute the spawn directly using the free function, bypassing the graph pipeline
+        match execute::execute_spawn(
+            Box::new(plain_reporter),
+            &spawn_execution,
+            cache,
+            &self.workspace_path,
+        )
+        .await
+        {
+            // Cache hit — no process was spawned, success
+            execute::SpawnOutcome::CacheHit => Ok(ExitStatus::SUCCESS),
+            // Process ran successfully
+            execute::SpawnOutcome::Spawned(status) if status.success() => Ok(ExitStatus::SUCCESS),
+            // Process ran but exited with non-zero status
+            execute::SpawnOutcome::Spawned(status) => {
+                let code = event::exit_status_to_code(status);
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "value is clamped to 1..=255, always positive"
+                )]
+                Ok(ExitStatus(code.clamp(1, 255) as u8))
+            }
+            // Infrastructure error — already reported through the reporter's finish()
+            execute::SpawnOutcome::Failed => Ok(ExitStatus::FAILURE),
+        }
     }
 
     /// Plans execution from a CLI run command.
@@ -476,13 +512,13 @@ impl<'a> Session<'a> {
         clippy::future_not_send,
         reason = "session is single-threaded, futures do not need to be Send"
     )]
-    pub async fn plan_from_cli(
+    pub async fn plan_from_cli_run(
         &mut self,
         cwd: Arc<AbsolutePath>,
         command: RunCommand,
-    ) -> Result<ExecutionPlan, vite_task_plan::Error> {
-        let plan_request = match command.into_plan_request(&cwd) {
-            Ok(plan_request) => plan_request,
+    ) -> Result<ExecutionGraph, vite_task_plan::Error> {
+        let query_plan_request = match command.into_query_plan_request(&cwd) {
+            Ok(query_plan_request) => query_plan_request,
             Err(crate::cli::CLITaskQueryError::MissingTaskSpecifier) => {
                 return Err(vite_task_plan::Error::MissingTaskSpecifier);
             }
@@ -495,15 +531,14 @@ impl<'a> Session<'a> {
                 });
             }
         };
-        let plan = ExecutionPlan::plan(
-            plan_request,
+        ExecutionPlan::plan_query(
+            query_plan_request,
             &self.workspace_path,
             &cwd,
             &self.envs,
             &mut self.plan_request_parser,
             &mut self.lazy_task_graph,
         )
-        .await?;
-        Ok(plan)
+        .await
     }
 }

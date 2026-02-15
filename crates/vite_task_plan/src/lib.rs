@@ -12,14 +12,13 @@ use std::{collections::BTreeMap, ffi::OsStr, fmt::Debug, sync::Arc};
 
 use context::PlanContext;
 pub use error::Error;
-use execution_graph::ExecutionGraph;
-use in_process::InProcessExecution;
+pub use execution_graph::ExecutionGraph;
+pub use in_process::InProcessExecution;
 pub use path_env::{get_path_env, prepend_path_env};
 use plan::{ParentCacheConfig, plan_query_request, plan_synthetic_request};
-use plan_request::{PlanRequest, SyntheticPlanRequest};
+use plan_request::{PlanRequest, QueryPlanRequest, SyntheticPlanRequest};
 use rustc_hash::FxHashMap;
-use serde::{Serialize, ser::SerializeMap as _};
-use vite_graph_ser::serialize_by_key;
+use serde::{Serialize, Serializer, ser::SerializeMap as _};
 use vite_path::AbsolutePath;
 use vite_str::Str;
 use vite_task_graph::{TaskGraphLoadError, display::TaskDisplay};
@@ -139,15 +138,22 @@ pub enum LeafExecutionKind {
     InProcess(InProcessExecution),
 }
 
+/// Serialize an `ExecutionGraph` using `serialize_by_key`.
+///
+/// `vite_graph_ser::serialize_by_key` expects `&DiGraph<N, E, Ix>`, so we call `.inner()`
+/// to get the underlying `DiGraph` reference.
+fn serialize_execution_graph_by_key<S: Serializer>(
+    graph: &ExecutionGraph,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    vite_graph_ser::serialize_by_key(graph.inner(), serializer)
+}
+
 /// An execution item, from a split subcommand in a task's command (`item1 && item2 && ...`).
 #[derive(Debug, Serialize)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "variants are used in-place, boxing would add indirection"
-)]
 pub enum ExecutionItemKind {
     /// Expanded from a known vp subcommand, like `vp run ...` or a synthesized task.
-    Expanded(#[serde(serialize_with = "serialize_by_key")] ExecutionGraph),
+    Expanded(#[serde(serialize_with = "serialize_execution_graph_by_key")] ExecutionGraph),
     /// A normal execution that spawns a child process, like `tsc --noEmit`.
     Leaf(LeafExecutionKind),
 }
@@ -191,6 +197,11 @@ impl ExecutionPlan {
         &self.root_node
     }
 
+    #[must_use]
+    pub fn into_root_node(self) -> ExecutionItemKind {
+        self.root_node
+    }
+
     /// Returns `true` if the plan contains no tasks to execute.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -198,6 +209,37 @@ impl ExecutionPlan {
             ExecutionItemKind::Expanded(graph) => graph.node_count() == 0,
             ExecutionItemKind::Leaf(_) => false,
         }
+    }
+
+    /// Create an execution plan from an execution graph.
+    #[must_use]
+    pub const fn from_execution_graph(execution_graph: ExecutionGraph) -> Self {
+        Self { root_node: ExecutionItemKind::Expanded(execution_graph) }
+    }
+
+    /// Plan a query execution: load the task graph, query it, and build the execution graph.
+    ///
+    /// # Errors
+    /// Returns an error if task graph loading, query, or execution planning fails.
+    #[expect(clippy::future_not_send, reason = "PlanRequestParser and TaskGraphLoader are !Send")]
+    pub async fn plan_query(
+        query_plan_request: QueryPlanRequest,
+        workspace_path: &Arc<AbsolutePath>,
+        cwd: &Arc<AbsolutePath>,
+        envs: &FxHashMap<Arc<OsStr>, Arc<OsStr>>,
+        plan_request_parser: &mut (dyn PlanRequestParser + '_),
+        task_graph_loader: &mut (dyn TaskGraphLoader + '_),
+    ) -> Result<ExecutionGraph, Error> {
+        let indexed_task_graph = task_graph_loader.load_task_graph().await?;
+
+        let context = PlanContext::new(
+            workspace_path,
+            Arc::clone(cwd),
+            envs.clone(),
+            plan_request_parser,
+            indexed_task_graph,
+        );
+        plan_query_request(query_plan_request, context).await
     }
 
     /// Plan an execution from a plan request.
@@ -215,16 +257,15 @@ impl ExecutionPlan {
     ) -> Result<Self, Error> {
         let root_node = match plan_request {
             PlanRequest::Query(query_plan_request) => {
-                let indexed_task_graph = task_graph_loader.load_task_graph().await?;
-
-                let context = PlanContext::new(
+                let execution_graph = Self::plan_query(
+                    query_plan_request,
                     workspace_path,
-                    Arc::clone(cwd),
-                    envs.clone(),
+                    cwd,
+                    envs,
                     plan_request_parser,
-                    indexed_task_graph,
-                );
-                let execution_graph = plan_query_request(query_plan_request, context).await?;
+                    task_graph_loader,
+                )
+                .await?;
                 ExecutionItemKind::Expanded(execution_graph)
             }
             PlanRequest::Synthetic(synthetic_plan_request) => {
@@ -242,7 +283,11 @@ impl ExecutionPlan {
         Ok(Self { root_node })
     }
 
-    /// Plan a synthetic task execution.
+    /// Plan a synthetic task execution, returning the resolved [`SpawnExecution`] directly.
+    ///
+    /// Unlike `plan_query` which returns a full execution graph, synthetic executions
+    /// are always a single spawned process. The caller can execute it directly using
+    /// `execute_spawn`.
     ///
     /// # Errors
     /// Returns an error if the program is not found or path fingerprinting fails.

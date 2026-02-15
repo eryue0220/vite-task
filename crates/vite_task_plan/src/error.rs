@@ -143,6 +143,14 @@ pub enum Error {
 
     #[error("No task specifier provided for 'run' command")]
     MissingTaskSpecifier,
+
+    /// A cycle was detected in the task dependency graph during planning.
+    ///
+    /// This is caught by `ExecutionGraph::try_from_graph`, which validates that the
+    /// graph is a DAG. The contained `TaskDisplay` identifies one of the tasks
+    /// involved in the cycle.
+    #[error("Cycle dependency detected involving task {0}")]
+    CycleDependencyDetected(TaskDisplay),
 }
 
 impl Error {

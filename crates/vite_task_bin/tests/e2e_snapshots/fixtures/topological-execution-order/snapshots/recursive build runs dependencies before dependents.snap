@@ -2,24 +2,32 @@
 source: crates/vite_task_bin/tests/e2e_snapshots/main.rs
 expression: e2e_outputs
 ---
-[1]> vp run -r fail # multiple failures -> exit code 1
-~/packages/pkg-a$ node -e "process.exit(42)"
+> vp run -r build # core -> lib -> app
+~/packages/core$ echo 'Building core' ⊘ cache disabled: built-in command
+Building core
 
-~/packages/pkg-b$ node -e "process.exit(7)"
+~/packages/lib$ echo 'Building lib' ⊘ cache disabled: built-in command
+Building lib
+
+~/packages/app$ echo 'Building app' ⊘ cache disabled: built-in command
+Building app
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     Vite+ Task Runner • Execution Summary
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Statistics:   2 tasks • 0 cache hits • 2 cache misses • 2 failed 
+Statistics:   3 tasks • 0 cache hits • 0 cache misses • 3 cache disabled 
 Performance:  0% cache hit rate
 
 Task Details:
 ────────────────────────────────────────────────
-  [1] pkg-a#fail: ~/packages/pkg-a$ node -e "process.exit(42)" ✗ (exit code: 42)
-      → Cache miss: no previous cache entry found
+  [1] @topo/core#build: ~/packages/core$ echo 'Building core' ✓
+      → Cache disabled for built-in command
   ·······················································
-  [2] pkg-b#fail: ~/packages/pkg-b$ node -e "process.exit(7)" ✗ (exit code: 7)
-      → Cache miss: no previous cache entry found
+  [2] @topo/lib#build: ~/packages/lib$ echo 'Building lib' ✓
+      → Cache disabled for built-in command
+  ·······················································
+  [3] @topo/app#build: ~/packages/app$ echo 'Building app' ✓
+      → Cache disabled for built-in command
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

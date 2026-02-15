@@ -11,6 +11,7 @@ use tokio::runtime::Runtime;
 use vite_path::{AbsolutePath, AbsolutePathBuf, RelativePathBuf};
 use vite_str::Str;
 use vite_task::{Command, Session};
+use vite_task_plan::ExecutionPlan;
 use vite_workspace::find_workspace_root;
 
 /// Local parser wrapper for `BuiltInCommand`
@@ -179,18 +180,30 @@ fn run_case_inner(
                 panic!("only `run` commands supported in plan tests")
             };
 
-            let plan_result =
-                session.plan_from_cli(workspace_root.path.join(plan.cwd).into(), run_command).await;
+            let plan_result = session
+                .plan_from_cli_run(workspace_root.path.join(plan.cwd).into(), run_command)
+                .await;
 
             let plan = match plan_result {
-                Ok(plan) => plan,
+                Ok(graph) => ExecutionPlan::from_execution_graph(graph),
                 Err(err) => {
+                    // Format the full error chain using anyhow's `{:#}` formatter
+                    // and redact workspace paths for snapshot stability.
+                    let anyhow_err: anyhow::Error = err.into();
+                    let err_formatted = vite_str::format!("{anyhow_err:#}");
+                    let err_str =
+                        err_formatted.as_str().cow_replace(workspace_root_str, "<workspace>");
+                    let err_str = if cfg!(windows) {
+                        err_str.as_ref().cow_replace('\\', "/")
+                    } else {
+                        err_str
+                    };
                     #[expect(
                         clippy::disallowed_macros,
-                        reason = "insta::assert_debug_snapshot! internally uses std::format!"
+                        reason = "insta::assert_snapshot! internally uses std::format!"
                     )]
                     {
-                        insta::assert_debug_snapshot!(snapshot_name.as_str(), err);
+                        insta::assert_snapshot!(snapshot_name.as_str(), err_str.as_ref());
                     }
                     continue;
                 }
