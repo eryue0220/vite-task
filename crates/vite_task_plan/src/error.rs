@@ -144,8 +144,8 @@ pub enum Error {
     ///
     /// At the top level, an empty execution graph triggers the task selector UI.
     /// In a nested context there is no UI, so this is returned as an error instead.
-    #[error("no tasks matched the query")]
-    NoTasksMatched,
+    #[error("Task \"{0}\" not found")]
+    NoTasksMatched(Str),
 
     /// A cycle was detected in the task dependency graph during planning.
     ///
@@ -154,11 +154,4 @@ pub enum Error {
     /// as a closed loop (the first and last elements are the same).
     #[error("Cycle dependency detected: {}", _0.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(" -> "))]
     CycleDependencyDetected(Vec<TaskDisplay>),
-}
-
-impl Error {
-    #[must_use]
-    pub const fn is_missing_task_specifier(&self) -> bool {
-        matches!(self, Self::MissingTaskSpecifier)
-    }
 }
