@@ -74,7 +74,16 @@ impl RunFlags {
 ///
 /// Contains the `--last-details` flag which is resolved into a separate
 /// `ResolvedCommand::RunLastDetails` variant internally.
+///
+/// `trailing_var_arg` at the command level makes clap stop matching flags once
+/// the trailing positional starts being filled. This means all tokens after the
+/// task name are passed through to the task verbatim, preventing flags like `-v`
+/// from being intercepted. Flags intended for `vp` itself (e.g. `--verbose`,
+/// `-r`) must appear **before** the task name.
+///
+/// See <https://github.com/voidzero-dev/vite-task/issues/285>.
 #[derive(Debug, clap::Parser)]
+#[command(trailing_var_arg = true)]
 pub struct RunCommand {
     #[clap(flatten)]
     pub(crate) flags: RunFlags,
@@ -83,11 +92,11 @@ pub struct RunCommand {
     #[clap(long, exclusive = true)]
     pub(crate) last_details: bool,
 
-    /// The task name and all arguments to pass to the task process
-    /// Prevent flags after the task name to be consumed by Vite Task with `trailing_var_arg`
-    ///
-    /// <https://github.com/voidzero-dev/vite-task/issues/285>
-    #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[clap(
+        allow_hyphen_values = true,
+        value_names = ["TASK_SPECIFIER", "ADDITIONAL_ARGS"],
+        long_help = "Task to run, as `packageName#taskName` or just `taskName`.\nAny arguments after the task name are forwarded to the task process.\nRunning `vp run` without a task name shows an interactive task selector."
+    )]
     pub(crate) task_and_args: Vec<Str>,
 }
 
@@ -160,14 +169,15 @@ pub struct ResolvedRunCommand {
 
 impl RunCommand {
     /// Convert to the resolved run command, stripping the `last_details` flag.
+    ///
+    /// Splits `task_and_args` into `task_specifier` (the first element) and
+    /// `additional_args` (everything that follows).
     #[must_use]
     pub(crate) fn into_resolved(self) -> ResolvedRunCommand {
         let mut iter = self.task_and_args.into_iter();
-        ResolvedRunCommand {
-            task_specifier: iter.next(),
-            flags: self.flags,
-            additional_args: iter.collect(),
-        }
+        let task_specifier = iter.next();
+        let additional_args: Vec<Str> = iter.collect();
+        ResolvedRunCommand { task_specifier, flags: self.flags, additional_args }
     }
 }
 
