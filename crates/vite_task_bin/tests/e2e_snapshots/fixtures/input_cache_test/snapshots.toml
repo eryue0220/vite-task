@@ -1,12 +1,9 @@
-comment = """
-Test all input configuration combinations for cache behavior
-"""
-
-# 1. Positive globs only: input: ["src/**/*.ts"]
-# - Files matching the glob trigger cache invalidation
-# - Files outside the glob do NOT trigger cache invalidation
 [[e2e]]
 name = "positive_globs_only___cache_hit_on_second_run"
+comment = """
+With only positive globs (`src/**/*.ts`) and no file changes, a second run
+should be a cache hit.
+"""
 steps = [
   # First run - cache miss
   ["vt", "run", "positive-globs-only"],
@@ -16,6 +13,9 @@ steps = [
 
 [[e2e]]
 name = "positive_globs_only___miss_on_matched_file_change"
+comment = """
+Modifying a file matched by a positive glob should invalidate the cache.
+"""
 steps = [
   # Initial run
   ["vt", "run", "positive-globs-only"],
@@ -27,6 +27,10 @@ steps = [
 
 [[e2e]]
 name = "positive_globs_only___hit_on_unmatched_file_change"
+comment = """
+Modifying a file outside the positive glob (e.g. under `test/`) should not
+invalidate the cache.
+"""
 steps = [
   # Initial run
   ["vt", "run", "positive-globs-only"],
@@ -36,11 +40,12 @@ steps = [
   ["vt", "run", "positive-globs-only"],
 ]
 
-# 1b. Positive globs reads unmatched file: input: ["src/main.ts"], command reads src/utils.ts too
-# - File read by command but NOT matched by glob should NOT be fingerprinted
-# - This tests that inference is truly disabled when only explicit globs are used
 [[e2e]]
 name = "positive_globs___hit_on_read_but_unmatched_file"
+comment = """
+With only positive globs (no `auto`), files read at runtime but not matched
+by the glob should not be fingerprinted — inference is truly disabled.
+"""
 steps = [
   # Initial run - reads both src/main.ts and src/utils.ts
   ["vt", "run", "positive-globs-reads-unmatched"],
@@ -50,11 +55,12 @@ steps = [
   ["vt", "run", "positive-globs-reads-unmatched"],
 ]
 
-# 2. Positive + negative globs: input: ["src/**", "!src/**/*.test.ts"]
-# - Files matching positive but NOT negative trigger invalidation
-# - Files matching negative glob are excluded
 [[e2e]]
 name = "positive_negative_globs___miss_on_non_excluded_file"
+comment = """
+A file matched by a positive glob and not by any negative glob should still
+invalidate the cache when modified.
+"""
 steps = [
   # Initial run
   ["vt", "run", "positive-negative-globs"],
@@ -66,6 +72,10 @@ steps = [
 
 [[e2e]]
 name = "positive_negative_globs___hit_on_excluded_file"
+comment = """
+A file matched by the negative glob should be excluded from fingerprinting
+even if it also matches a positive glob.
+"""
 steps = [
   # Initial run
   ["vt", "run", "positive-negative-globs"],
@@ -75,11 +85,12 @@ steps = [
   ["vt", "run", "positive-negative-globs"],
 ]
 
-# 3. Auto only: input: [{ "auto": true }]
-# - Files read by the command trigger invalidation (fspy inference)
-# - Files NOT read by the command do NOT trigger invalidation
 [[e2e]]
 name = "auto_only___miss_on_inferred_file_change"
+comment = """
+With `auto: true`, files read by the command (via fspy) should be fingerprinted
+and a change to such a file should invalidate the cache.
+"""
 steps = [
   # Initial run - reads src/main.ts
   ["vt", "run", "auto-only"],
@@ -91,6 +102,10 @@ steps = [
 
 [[e2e]]
 name = "auto_only___hit_on_non_inferred_file_change"
+comment = """
+With `auto: true`, a file never read by the command should not affect the
+cache, even if it sits next to files that are read.
+"""
 steps = [
   # Initial run - reads src/main.ts (NOT utils.ts)
   ["vt", "run", "auto-only"],
@@ -100,11 +115,12 @@ steps = [
   ["vt", "run", "auto-only"],
 ]
 
-# 4. Auto + negative: input: [{ "auto": true }, "!dist/**"]
-# - Inferred files are tracked, but negative globs filter them out
-# - Files in excluded directories don't trigger invalidation even if read
 [[e2e]]
 name = "auto_with_negative___hit_on_excluded_inferred_file"
+comment = """
+A negative glob should filter out inferred inputs — a `dist/**`-excluded file
+that the command happens to read should not invalidate the cache.
+"""
 steps = [
   # Initial run - reads both src/main.ts and dist/output.js
   ["vt", "run", "auto-with-negative"],
@@ -116,6 +132,10 @@ steps = [
 
 [[e2e]]
 name = "auto_with_negative___miss_on_non_excluded_inferred_file"
+comment = """
+With `auto: true` plus a negative glob, changes to inferred inputs outside
+the excluded range should still invalidate the cache.
+"""
 steps = [
   # Initial run
   ["vt", "run", "auto-with-negative"],
@@ -125,11 +145,12 @@ steps = [
   ["vt", "run", "auto-with-negative"],
 ]
 
-# 5. Positive + auto + negative: input: ["package.json", { "auto": true }, "!src/**/*.test.ts"]
-# - Explicit globs AND inferred files are both tracked
-# - Negative globs apply to both explicit and inferred input
 [[e2e]]
 name = "positive_auto_negative___miss_on_explicit_glob_file"
+comment = """
+When positive, `auto`, and negative globs are combined, modifying a file
+matched by the explicit positive glob should invalidate the cache.
+"""
 steps = [
   # Initial run
   ["vt", "run", "positive-auto-negative"],
@@ -141,6 +162,10 @@ steps = [
 
 [[e2e]]
 name = "positive_auto_negative___miss_on_inferred_file"
+comment = """
+Under combined positive + `auto` + negative config, modifying a file that
+only the `auto` inference discovered should still invalidate the cache.
+"""
 steps = [
   # Initial run
   ["vt", "run", "positive-auto-negative"],
@@ -152,6 +177,10 @@ steps = [
 
 [[e2e]]
 name = "positive_auto_negative___hit_on_excluded_file"
+comment = """
+Under combined positive + `auto` + negative config, a negative glob should
+still filter files contributed by either source.
+"""
 steps = [
   # Initial run
   ["vt", "run", "positive-auto-negative"],
@@ -161,11 +190,12 @@ steps = [
   ["vt", "run", "positive-auto-negative"],
 ]
 
-# 6. Empty input: input: []
-# - No file changes affect the cache
-# - Only command/env changes trigger cache invalidation
 [[e2e]]
 name = "empty_input___hit_despite_file_changes"
+comment = """
+With `input: []`, no file changes should ever invalidate the cache — only
+command/env changes can.
+"""
 steps = [
   # Initial run
   ["vt", "run", "empty-inputs"],
@@ -177,6 +207,10 @@ steps = [
 
 [[e2e]]
 name = "empty_input___miss_on_command_change"
+comment = """
+Even with `input: []`, changing the task's command should still invalidate
+the cache.
+"""
 steps = [
   # Initial run
   [
@@ -200,11 +234,12 @@ steps = [
   ],
 ]
 
-# 7. FSPY environment variable
-# - FSPY=1 is set when fspy is enabled (includes_auto is true)
-# - FSPY is NOT set when fspy is disabled (explicit globs only)
 [[e2e]]
 name = "fspy_env___set_when_auto_inference_enabled"
+comment = """
+When auto-inference is enabled (input includes `{auto: true}`), the task
+process should see `FSPY=1` in its environment.
+"""
 steps = [
   # Run task with auto inference - should see FSPY=1
   ["vt", "run", "check-fspy-env-with-auto"],
@@ -212,17 +247,21 @@ steps = [
 
 [[e2e]]
 name = "fspy_env___not_set_when_auto_inference_disabled"
+comment = """
+When auto-inference is disabled (explicit globs only), the task process
+should not see `FSPY` set.
+"""
 steps = [
   # Run task without auto inference - should see (undefined)
   ["vt", "run", "check-fspy-env-without-auto"],
 ]
 
-# 8. Trailing slash input: input: ["src/"]
-# - Trailing `/` is expanded to `/**`, matching all files under that directory
-# - Direct and nested file changes trigger cache invalidation
-# - Files outside the directory do NOT trigger cache invalidation
 [[e2e]]
 name = "folder_slash_input___miss_on_direct_and_nested_file_changes"
+comment = """
+A trailing-slash input (`src/`) should expand to `src/**`, so both direct
+and nested file changes under it invalidate the cache.
+"""
 steps = [
   ["vt", "run", "folder-slash-input"],
   # Modify a direct file in src/
@@ -240,6 +279,10 @@ steps = [
 
 [[e2e]]
 name = "folder_slash_input___hit_on_file_outside_directory"
+comment = """
+With a trailing-slash input (`src/`), files outside the directory should not
+be part of the fingerprint.
+"""
 steps = [
   ["vt", "run", "folder-slash-input"],
   # Modify a file outside src/
@@ -248,11 +291,12 @@ steps = [
   ["vt", "run", "folder-slash-input"],
 ]
 
-# 9. Folder path as input: input: ["src"]
-# - A bare directory name matches nothing (directories are not files)
-# - File changes inside the folder should NOT trigger cache invalidation
 [[e2e]]
 name = "folder_input___hit_despite_file_changes_and_folder_deletion"
+comment = """
+A bare directory name as input (`src`) matches only the directory entry,
+not its contents — neither file edits nor folder deletion affect the cache.
+"""
 steps = [
   ["vt", "run", "folder-input"],
   # Modify a file inside the folder
